@@ -70,6 +70,71 @@ def get_recent_activities(days=7, per_page=100):
 
     return response.json(), None
 
+def get_activity_detail(activity_id):
+    access_token = ensure_access_token()
+    if not access_token:
+        return None, ("Not connected to Strava yet", 401)
+
+    response = requests.get(
+        f"https://www.strava.com/api/v3/activities/{activity_id}",
+        headers={"Authorization": f"Bearer {access_token}"},
+        timeout=30,
+    )
+
+    if response.status_code != 200:
+        return None, (response.text, response.status_code)
+
+    return response.json(), None
+
+def get_activity_zones(activity_id):
+    access_token = ensure_access_token()
+    if not access_token:
+        return None, ("Not connected to Strava yet", 401)
+
+    response = requests.get(
+        f"https://www.strava.com/api/v3/activities/{activity_id}/zones",
+        headers={"Authorization": f"Bearer {access_token}"},
+        timeout=30,
+    )
+
+    if response.status_code != 200:
+        return None, (response.text, response.status_code)
+
+    return response.json(), None
+
+def extract_hr_zone_data(zones_payload):
+    for zone_group in zones_payload:
+        if zone_group.get("type") == "heartrate":
+            buckets = zone_group.get("distribution_buckets", [])
+
+            hr_zone_seconds = {}
+            hr_zone_minutes = {}
+
+            for idx, bucket in enumerate(buckets, start=1):
+                zone_name = f"z{idx}"
+                seconds = bucket.get("time", 0) or 0
+                hr_zone_seconds[zone_name] = seconds
+                hr_zone_minutes[zone_name] = round(seconds / 60, 1)
+
+            return {
+                "hr_zone_seconds": hr_zone_seconds,
+                "hr_zone_minutes": hr_zone_minutes,
+                "hr_zone_bounds": [
+                    {
+                        "zone": f"z{idx}",
+                        "min": bucket.get("min"),
+                        "max": bucket.get("max")
+                    }
+                    for idx, bucket in enumerate(buckets, start=1)
+                ]
+            }
+
+    return {
+        "hr_zone_seconds": None,
+        "hr_zone_minutes": None,
+        "hr_zone_bounds": None
+    }
+
 @app.route("/")
 def home():
     return """
@@ -128,16 +193,44 @@ def exchange_token():
         "expires_at": tokens["expires_at"]
     })
 
+@app.route("/activity/<int:activity_id>")
+def activity_detail(activity_id):
+    detail, error = get_activity_detail(activity_id)
+    if error:
+        message, status = error
+        return jsonify({"error": message}), status
+    return jsonify(detail)
+
+@app.route("/workouts")
 @app.route("/workouts")
 def workouts():
-    activities, error = get_recent_activities(days=7, per_page=100)
+    activities, error = get_recent_activities(days=7, per_page=25)
     if error:
         message, status = error
         return jsonify({"error": message}), status
 
-    simplified = []
+    enriched = []
+
     for a in activities:
-        simplified.append({
+        activity_id = a.get("id")
+        avg_hr = a.get("average_heartrate")
+        max_hr = a.get("max_heartrate")
+        has_hr = a.get("has_heartrate", False)
+
+        hr_zone_seconds = None
+        hr_zone_minutes = None
+        hr_zone_bounds = None
+
+        if activity_id and has_hr:
+            zones_payload, zones_error = get_activity_zones(activity_id)
+            if not zones_error:
+                zone_data = extract_hr_zone_data(zones_payload)
+                hr_zone_seconds = zone_data["hr_zone_seconds"]
+                hr_zone_minutes = zone_data["hr_zone_minutes"]
+                hr_zone_bounds = zone_data["hr_zone_bounds"]
+
+        enriched.append({
+            "id": activity_id,
             "name": a.get("name"),
             "sport_type": a.get("sport_type"),
             "start_date": a.get("start_date"),
@@ -145,9 +238,15 @@ def workouts():
             "moving_time_s": a.get("moving_time", 0),
             "elapsed_time_s": a.get("elapsed_time", 0),
             "total_elevation_gain_m": a.get("total_elevation_gain", 0),
+            "avg_heartrate": avg_hr,
+            "max_heartrate": max_hr,
+            "has_heartrate": has_hr,
+            "hr_zone_seconds": hr_zone_seconds,
+            "hr_zone_minutes": hr_zone_minutes,
+            "hr_zone_bounds": hr_zone_bounds,
         })
 
-    return jsonify({"workouts": simplified})
+    return jsonify({"workouts": enriched})
 
 @app.route("/summary")
 def summary():
@@ -188,5 +287,13 @@ def summary():
         "readiness": "unknown"
     })
 
+@app.route("/activity/<int:activity_id>/zones")
+def activity_zones(activity_id):
+    zones, error = get_activity_zones(activity_id)
+    if error:
+        message, status = error
+        return jsonify({"error": message}), status
+    return jsonify(zones)
+
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000, debug=True)
+    app.run(host="0.0.0.0", port=5001, debug=True)
