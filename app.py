@@ -102,38 +102,43 @@ def get_activity_zones(activity_id):
 
     return response.json(), None
 
-def extract_hr_zone_data(zones_payload):
+def extract_zone_data(zones_payload):
+    zone_summary = {}
+
     for zone_group in zones_payload:
-        if zone_group.get("type") == "heartrate":
-            buckets = zone_group.get("distribution_buckets", [])
+        zone_type = zone_group.get("type")
+        buckets = zone_group.get("distribution_buckets", [])
 
-            hr_zone_seconds = {}
-            hr_zone_minutes = {}
+        if not zone_type or not buckets:
+            continue
 
-            for idx, bucket in enumerate(buckets, start=1):
-                zone_name = f"z{idx}"
-                seconds = bucket.get("time", 0) or 0
-                hr_zone_seconds[zone_name] = seconds
-                hr_zone_minutes[zone_name] = round(seconds / 60, 1)
+        zone_seconds = {}
+        zone_minutes = {}
+        zone_bounds = []
 
-            return {
-                "hr_zone_seconds": hr_zone_seconds,
-                "hr_zone_minutes": hr_zone_minutes,
-                "hr_zone_bounds": [
-                    {
-                        "zone": f"z{idx}",
-                        "min": bucket.get("min"),
-                        "max": bucket.get("max")
-                    }
-                    for idx, bucket in enumerate(buckets, start=1)
-                ]
-            }
+        for idx, bucket in enumerate(buckets, start=1):
+            zone_name = f"z{idx}"
+            seconds = bucket.get("time", 0) or 0
 
-    return {
-        "hr_zone_seconds": None,
-        "hr_zone_minutes": None,
-        "hr_zone_bounds": None
-    }
+            zone_seconds[zone_name] = seconds
+            zone_minutes[zone_name] = round(seconds / 60, 1)
+            zone_bounds.append({
+                "zone": zone_name,
+                "min": bucket.get("min"),
+                "max": bucket.get("max"),
+            })
+
+        zone_summary[zone_type] = {
+            "seconds": zone_seconds,
+            "minutes": zone_minutes,
+            "bounds": zone_bounds,
+            "custom_zones": zone_group.get("custom_zones"),
+            "sensor_based": zone_group.get("sensor_based"),
+            "score": zone_group.get("score"),
+            "points": zone_group.get("points"),
+        }
+
+    return zone_summary
 
 @app.route("/")
 def home():
@@ -202,7 +207,6 @@ def activity_detail(activity_id):
     return jsonify(detail)
 
 @app.route("/workouts")
-@app.route("/workouts")
 def workouts():
     activities, error = get_recent_activities(days=7, per_page=25)
     if error:
@@ -217,17 +221,12 @@ def workouts():
         max_hr = a.get("max_heartrate")
         has_hr = a.get("has_heartrate", False)
 
-        hr_zone_seconds = None
-        hr_zone_minutes = None
-        hr_zone_bounds = None
+        zones = {}
 
-        if activity_id and has_hr:
+        if activity_id:
             zones_payload, zones_error = get_activity_zones(activity_id)
             if not zones_error:
-                zone_data = extract_hr_zone_data(zones_payload)
-                hr_zone_seconds = zone_data["hr_zone_seconds"]
-                hr_zone_minutes = zone_data["hr_zone_minutes"]
-                hr_zone_bounds = zone_data["hr_zone_bounds"]
+                zones = extract_zone_data(zones_payload)
 
         enriched.append({
             "id": activity_id,
@@ -241,9 +240,14 @@ def workouts():
             "avg_heartrate": avg_hr,
             "max_heartrate": max_hr,
             "has_heartrate": has_hr,
-            "hr_zone_seconds": hr_zone_seconds,
-            "hr_zone_minutes": hr_zone_minutes,
-            "hr_zone_bounds": hr_zone_bounds,
+
+            # legacy-friendly fields
+            "hr_zone_seconds": zones.get("heartrate", {}).get("seconds"),
+            "hr_zone_minutes": zones.get("heartrate", {}).get("minutes"),
+            "hr_zone_bounds": zones.get("heartrate", {}).get("bounds"),
+
+            # new generalized structure
+            "zones": zones
         })
 
     return jsonify({"workouts": enriched})
