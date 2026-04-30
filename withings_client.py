@@ -41,6 +41,7 @@ def refresh_withings_access_token():
     withings_tokens["refresh_token"] = body["refresh_token"]
     withings_tokens["userid"] = body.get("userid")
     withings_tokens["expires_at"] = time.time() + body.get("expires_in", 10800)
+    save_service_tokens("withings", withings_tokens)
 
     return withings_tokens["access_token"]
 
