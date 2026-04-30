@@ -44,8 +44,13 @@ def ensure_access_token():
     refresh_token = tokens.get("refresh_token")
     expires_at = tokens.get("expires_at", 0)
 
-    if access_token and time.time() < expires_at - 60:
-        return access_token
+    try:
+        expires_at = float(expires_at)
+    except (TypeError, ValueError):
+        expires_at = 0
+
+if access_token and time.time() < expires_at - 60:
+    return access_token
 
     if not refresh_token:
         return None
