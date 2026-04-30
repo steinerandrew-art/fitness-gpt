@@ -347,10 +347,13 @@ def summary():
     if error:
         message, status = error
 
-        if status == 401 or "Not connected to Strava yet" in str(message):
+        if status == 401:
             return redirect("/login")
 
-        return jsonify({"error": message}), status
+        return jsonify({
+            "error": message,
+            "status": status
+        }), status
 
     workout_count = len(activities)
     total_distance_m = sum(a.get("distance", 0) or 0 for a in activities)
@@ -376,9 +379,7 @@ def summary():
 
     withings_data = get_withings_summary()
 
-    if (
-        withings_data.get("status") == "not_connected"
-    ):
+    if withings_data.get("status") == "not_connected":
         return redirect("/connect/withings")
 
     summary_data = {

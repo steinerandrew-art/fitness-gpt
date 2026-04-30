@@ -33,7 +33,9 @@ def refresh_withings_access_token():
     data = response.json()
 
     if response.status_code != 200 or data.get("status") != 0:
-        return None
+        return {
+            "status": "not_connected"
+        }
 
     body = data["body"]
 
@@ -62,7 +64,9 @@ def exchange_withings_code(code):
     data = response.json()
 
     if response.status_code != 200 or data.get("status") != 0:
-        return None, (data, 400)
+        return {
+            "status": "not_connected"
+        }
 
     body = data["body"]
 
@@ -107,7 +111,9 @@ def get_withings_measures():
     access_token = withings_tokens.get("access_token")
 
     if not access_token:
-        return None, ("Not connected to Withings yet", 401)
+        return {
+            "status": "not_connected"
+        }
 
     enddate = int(datetime.now(timezone.utc).timestamp())
     startdate = int((datetime.now(timezone.utc) - timedelta(days=14)).timestamp())
@@ -130,7 +136,9 @@ def get_withings_measures():
     data = response.json()
 
     if response.status_code != 200 or data.get("status") != 0:
-        return None, (data, 400)
+        return {
+            "status": "not_connected"
+        }
 
     return data.get("body", {}), None
 
