@@ -163,6 +163,66 @@ def callback_withings():
         "expires_in": token_data.get("expires_in")
     })
 
+
+def build_coaching_insights(summary_data, withings_data):
+    insights = []
+
+    total_hours = summary_data.get("total_moving_time_hr", 0)
+    workout_count = summary_data.get("workout_count", 0)
+    sport_counts = summary_data.get("sport_counts", {})
+    flags = summary_data.get("flags", [])
+
+    if "high_training_volume" in flags:
+        insights.append(
+            f"High training volume: {total_hours} hours across {workout_count} workouts in this period."
+        )
+
+    if workout_count >= 10:
+        insights.append(
+            "Workout frequency is high, so recovery quality should be watched closely."
+        )
+
+    if len(sport_counts) >= 3:
+        insights.append(
+            "Training mix is diversified across multiple activity types."
+        )
+
+    trends = withings_data.get("trends", {})
+    smoothed_weight_change = trends.get("weight_change_smoothed_lb")
+
+    if smoothed_weight_change is not None:
+        if abs(smoothed_weight_change) < 1:
+            insights.append(
+                f"Smoothed weight trend is stable at {smoothed_weight_change:+.1f} lb."
+            )
+        elif smoothed_weight_change > 0:
+            insights.append(
+                f"Smoothed weight trend is up {smoothed_weight_change:+.1f} lb; consider hydration, sodium, soreness, and training load before treating it as tissue gain."
+            )
+        else:
+            insights.append(
+                f"Smoothed weight trend is down {smoothed_weight_change:+.1f} lb; watch whether energy and workout quality remain strong."
+            )
+
+    latest = withings_data.get("latest", {})
+    measurements = latest.get("measurements", {})
+
+    if measurements.get("weight_lb") is not None:
+        insights.append(
+            f"Latest weight is {measurements.get('weight_lb')} lb."
+        )
+
+    if measurements.get("fat_ratio_pct") is not None:
+        insights.append(
+            f"Latest body fat estimate is {measurements.get('fat_ratio_pct')}%, which should be treated as directional rather than exact."
+        )
+
+    if not insights:
+        insights.append("Not enough combined training and body data yet to generate useful insights.")
+
+    return insights
+
+
 @app.route("/summary")
 def summary():
     activities, error = get_recent_activities(days=14, per_page=100)
@@ -202,7 +262,7 @@ def summary():
     ):
         return redirect("/connect/withings")
 
-    return jsonify({
+    summary_data = {
         "period_days": 14,
         "workout_count": workout_count,
         "total_distance_km": total_distance_km,
@@ -212,10 +272,12 @@ def summary():
         "sport_counts": sport_counts,
         "flags": flags,
         "readiness": "unknown",
-
-        # NEW
         "withings": withings_data
-    })
+    }
+
+    summary_data["insights"] = build_coaching_insights(summary_data, withings_data)
+
+    return jsonify(summary_data)
 
 
 @app.route("/activity/<int:activity_id>/zones")
