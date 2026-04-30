@@ -1,4 +1,5 @@
 from datetime import datetime, timedelta, timezone
+from token_store import get_service_tokens, save_service_tokens
 
 import os
 import requests
@@ -6,9 +7,42 @@ import requests
 WITHINGS_CLIENT_ID = os.environ["WITHINGS_CLIENT_ID"]
 WITHINGS_CLIENT_SECRET = os.environ["WITHINGS_CLIENT_SECRET"]
 WITHINGS_REDIRECT_URI = os.environ["WITHINGS_REDIRECT_URI"]
+WITHINGS_REFRESH_TOKEN = os.getenv("WITHINGS_REFRESH_TOKEN")
 
-withings_tokens = {}
+withings_tokens = get_service_tokens("withings")
 
+
+def refresh_withings_access_token():
+    refresh_token = withings_tokens.get("refresh_token") or WITHINGS_REFRESH_TOKEN
+
+    if not refresh_token:
+        return None
+
+    response = requests.post(
+        "https://wbsapi.withings.net/v2/oauth2",
+        data={
+            "action": "requesttoken",
+            "grant_type": "refresh_token",
+            "client_id": WITHINGS_CLIENT_ID,
+            "client_secret": WITHINGS_CLIENT_SECRET,
+            "refresh_token": refresh_token,
+        },
+        timeout=30,
+    )
+
+    data = response.json()
+
+    if response.status_code != 200 or data.get("status") != 0:
+        return None
+
+    body = data["body"]
+
+    withings_tokens["access_token"] = body["access_token"]
+    withings_tokens["refresh_token"] = body["refresh_token"]
+    withings_tokens["userid"] = body.get("userid")
+    withings_tokens["expires_at"] = time.time() + body.get("expires_in", 10800)
+
+    return withings_tokens["access_token"]
 
 def exchange_withings_code(code):
     response = requests.post(
@@ -35,6 +69,7 @@ def exchange_withings_code(code):
     withings_tokens["refresh_token"] = body["refresh_token"]
     withings_tokens["userid"] = body["userid"]
     withings_tokens["expires_in"] = body["expires_in"]
+    save_service_tokens("withings", withings_tokens)
 
     return body, None
 

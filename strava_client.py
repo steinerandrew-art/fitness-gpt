@@ -1,6 +1,7 @@
 import os
 import time
 from datetime import datetime, timedelta, timezone
+from token_store import get_service_tokens, save_service_tokens
 
 import requests
 
@@ -9,7 +10,7 @@ CLIENT_ID = os.environ["STRAVA_CLIENT_ID"]
 CLIENT_SECRET = os.environ["STRAVA_CLIENT_SECRET"]
 REDIRECT_URI = os.environ["REDIRECT_URI"]
 
-tokens = {}
+tokens = get_service_tokens("strava")
 
 
 def exchange_strava_code(code):
@@ -33,6 +34,7 @@ def exchange_strava_code(code):
     tokens["refresh_token"] = token_data["refresh_token"]
     tokens["expires_at"] = token_data["expires_at"]
     tokens["athlete"] = token_data.get("athlete", {})
+    save_service_tokens("strava", tokens)
 
     return token_data, None
 
@@ -66,6 +68,7 @@ def ensure_access_token():
     tokens["access_token"] = token_data["access_token"]
     tokens["refresh_token"] = token_data["refresh_token"]
     tokens["expires_at"] = token_data["expires_at"]
+    save_service_tokens("strava", tokens)
 
     return tokens["access_token"]
 
