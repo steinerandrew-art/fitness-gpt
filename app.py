@@ -223,6 +223,124 @@ def build_coaching_insights(summary_data, withings_data):
     return insights
 
 
+def summarize_zone_minutes(zones, preferred_types):
+    """
+    Returns zone minutes for the first available preferred zone type.
+    Example preferred_types: ["power", "heartrate"]
+    """
+    for zone_type in preferred_types:
+        zone_data = zones.get(zone_type)
+        if zone_data and zone_data.get("minutes"):
+            return {
+                "zone_type": zone_type,
+                "minutes": zone_data.get("minutes"),
+                "bounds": zone_data.get("bounds")
+            }
+
+    return {
+        "zone_type": None,
+        "minutes": {},
+        "bounds": []
+    }
+
+
+def build_intensity_summary(activities):
+    intensity_summary = {
+        "hard_workout_count": 0,
+        "moderate_workout_count": 0,
+        "easy_workout_count": 0,
+        "workouts": []
+    }
+
+    for a in activities:
+        activity_id = a.get("id")
+        sport = a.get("sport_type", "Unknown")
+
+        zones = {}
+        if activity_id:
+            zones_payload, zones_error = get_activity_zones(activity_id)
+            if not zones_error:
+                zones = extract_zone_data(zones_payload)
+
+        if sport in ["VirtualRide", "Ride"]:
+            preferred = summarize_zone_minutes(zones, ["power", "heartrate"])
+        elif sport == "Run":
+            preferred = summarize_zone_minutes(zones, ["pace", "heartrate"])
+        else:
+            preferred = summarize_zone_minutes(zones, ["heartrate", "power", "pace"])
+
+        minutes = preferred.get("minutes", {})
+
+        z1 = minutes.get("z1", 0) or 0
+        z2 = minutes.get("z2", 0) or 0
+        z3 = minutes.get("z3", 0) or 0
+        z4 = minutes.get("z4", 0) or 0
+        z5 = minutes.get("z5", 0) or 0
+
+        hard_minutes = z4 + z5
+        moderate_minutes = z3
+        easy_minutes = z1 + z2
+
+        if hard_minutes >= 15:
+            intensity = "hard"
+            intensity_summary["hard_workout_count"] += 1
+        elif hard_minutes >= 5 or moderate_minutes >= 20:
+            intensity = "moderate"
+            intensity_summary["moderate_workout_count"] += 1
+        else:
+            intensity = "easy"
+            intensity_summary["easy_workout_count"] += 1
+
+        intensity_summary["workouts"].append({
+            "id": activity_id,
+            "name": a.get("name"),
+            "sport_type": sport,
+            "start_date": a.get("start_date"),
+            "zone_type_used": preferred.get("zone_type"),
+            "easy_minutes": round(easy_minutes, 1),
+            "moderate_minutes": round(moderate_minutes, 1),
+            "hard_minutes": round(hard_minutes, 1),
+            "intensity": intensity
+        })
+
+    return intensity_summary
+
+
+def calculate_readiness(summary_data, withings_data):
+    reasons = []
+    caution_points = 0
+
+    flags = summary_data.get("flags", [])
+
+    if "high_training_volume" in flags:
+        reasons.append("Training volume is elevated, but this is interpreted cautiously because daily activity is normal for you.")
+
+    weight_change = withings_data.get("trends", {}).get("weight_change_smoothed_lb")
+
+    if weight_change is not None:
+        if abs(weight_change) < 1:
+            reasons.append("Smoothed weight trend is stable.")
+        elif weight_change < -1.5:
+            caution_points += 1
+            reasons.append("Weight trend is down meaningfully, which may suggest under-fueling or fluid loss.")
+        elif weight_change > 1.5:
+            caution_points += 1
+            reasons.append("Weight trend is up meaningfully, which may reflect water retention, soreness, or recovery stress.")
+
+    if caution_points >= 2:
+        level = "low"
+    elif caution_points == 1:
+        level = "moderate"
+    else:
+        level = "moderate_high"
+
+    return {
+        "level": level,
+        "caution_points": caution_points,
+        "reasons": reasons
+    }
+
+
 @app.route("/summary")
 def summary():
     activities, error = get_recent_activities(days=14, per_page=100)
@@ -253,6 +371,8 @@ def summary():
         flags.append("no_recent_training")
     if total_moving_time_hr > 10:
         flags.append("high_training_volume")
+    
+    intensity_summary = build_intensity_summary(activities)
 
     withings_data = get_withings_summary()
 
@@ -271,10 +391,12 @@ def summary():
         "sport_counts": sport_counts,
         "flags": flags,
         "readiness": "unknown",
-        "withings": withings_data
+        "withings": withings_data,
+        "intensity_summary": intensity_summary
     }
 
     summary_data["insights"] = build_coaching_insights(summary_data, withings_data)
+    summary_data["readiness"] = calculate_readiness(summary_data, withings_data)
 
     return jsonify(summary_data)
 
