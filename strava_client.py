@@ -49,8 +49,8 @@ def ensure_access_token():
     except (TypeError, ValueError):
         expires_at = 0
 
-if access_token and time.time() < expires_at - 60:
-    return access_token
+    if access_token and time.time() < expires_at - 60:
+        return access_token
 
     if not refresh_token:
         return None
