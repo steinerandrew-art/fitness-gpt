@@ -382,6 +382,7 @@ def summary():
         return redirect("/connect/withings")
 
     summary_data = {
+        "debug_version": "intensity-summary-v2",
         "period_days": 14,
         "workout_count": workout_count,
         "total_distance_km": total_distance_km,
