@@ -244,6 +244,74 @@ def summarize_zone_minutes(zones, preferred_types):
     }
 
 
+def get_zone_minutes(zones, zone_type):
+    zone_data = zones.get(zone_type, {})
+    minutes = zone_data.get("minutes", {}) or {}
+
+    return {
+        "z1": minutes.get("z1", 0) or 0,
+        "z2": minutes.get("z2", 0) or 0,
+        "z3": minutes.get("z3", 0) or 0,
+        "z4": minutes.get("z4", 0) or 0,
+        "z5": minutes.get("z5", 0) or 0,
+    }
+
+
+def classify_cycling_intensity(activity_name, power_minutes, hr_minutes):
+    name = (activity_name or "").lower()
+
+    power_hard = power_minutes["z4"] + power_minutes["z5"]
+    power_moderate = power_minutes["z3"]
+
+    hr_hard = hr_minutes["z4"] + hr_minutes["z5"]
+    hr_moderate = hr_minutes["z3"]
+
+    # Workout-name clues help when Strava/Zwift power zones are misaligned.
+    name_suggests_hard = any(
+        word in name
+        for word in ["threshold", "interval", "vo2", "anaerobic", "race"]
+    )
+
+    name_suggests_easy = any(
+        word in name
+        for word in ["easy", "zone 2", "z2", "recovery"]
+    )
+
+    # Conservative rule: power alone should not make an easy/zone 2 ride hard.
+    if name_suggests_easy and hr_hard < 10:
+        return "easy"
+
+    if name_suggests_hard and (power_hard >= 10 or hr_hard >= 5):
+        return "hard"
+
+    if hr_hard >= 15:
+        return "hard"
+
+    if power_hard >= 20 and hr_hard >= 5:
+        return "hard"
+
+    if hr_hard >= 5 or hr_moderate >= 20 or power_moderate >= 25:
+        return "moderate"
+
+    return "easy"
+
+
+def classify_running_intensity(pace_minutes, hr_minutes):
+    pace_hard = pace_minutes["z4"] + pace_minutes["z5"]
+    pace_moderate = pace_minutes["z3"]
+
+    hr_hard = hr_minutes["z4"] + hr_minutes["z5"]
+    hr_moderate = hr_minutes["z3"]
+
+    if pace_hard >= 15 or hr_hard >= 15:
+        return "hard"
+
+    if pace_hard >= 5 or hr_hard >= 5 or pace_moderate >= 20 or hr_moderate >= 20:
+        return "moderate"
+
+    return "easy"
+
+
 def build_intensity_summary(activities):
     intensity_summary = {
         "hard_workout_count": 0,
@@ -255,6 +323,7 @@ def build_intensity_summary(activities):
     for a in activities:
         activity_id = a.get("id")
         sport = a.get("sport_type", "Unknown")
+        name = a.get("name")
 
         zones = {}
         if activity_id:
@@ -262,41 +331,66 @@ def build_intensity_summary(activities):
             if not zones_error:
                 zones = extract_zone_data(zones_payload)
 
+        power_minutes = get_zone_minutes(zones, "power")
+        hr_minutes = get_zone_minutes(zones, "heartrate")
+        pace_minutes = get_zone_minutes(zones, "pace")
+
         if sport in ["VirtualRide", "Ride"]:
-            preferred = summarize_zone_minutes(zones, ["power", "heartrate"])
+            intensity = classify_cycling_intensity(name, power_minutes, hr_minutes)
+            primary_zone_type = "power_with_hr_crosscheck"
+            hard_minutes = max(
+                power_minutes["z4"] + power_minutes["z5"],
+                hr_minutes["z4"] + hr_minutes["z5"]
+            )
+            moderate_minutes = max(power_minutes["z3"], hr_minutes["z3"])
+            easy_minutes = max(
+                power_minutes["z1"] + power_minutes["z2"],
+                hr_minutes["z1"] + hr_minutes["z2"]
+            )
+
         elif sport == "Run":
-            preferred = summarize_zone_minutes(zones, ["pace", "heartrate"])
+            intensity = classify_running_intensity(pace_minutes, hr_minutes)
+            primary_zone_type = "pace_with_hr_crosscheck"
+            hard_minutes = max(
+                pace_minutes["z4"] + pace_minutes["z5"],
+                hr_minutes["z4"] + hr_minutes["z5"]
+            )
+            moderate_minutes = max(pace_minutes["z3"], hr_minutes["z3"])
+            easy_minutes = max(
+                pace_minutes["z1"] + pace_minutes["z2"],
+                hr_minutes["z1"] + hr_minutes["z2"]
+            )
+
         else:
-            preferred = summarize_zone_minutes(zones, ["heartrate", "power", "pace"])
+            hr_hard = hr_minutes["z4"] + hr_minutes["z5"]
+            hr_moderate = hr_minutes["z3"]
+            hr_easy = hr_minutes["z1"] + hr_minutes["z2"]
 
-        minutes = preferred.get("minutes", {})
+            if hr_hard >= 15:
+                intensity = "hard"
+            elif hr_hard >= 5 or hr_moderate >= 20:
+                intensity = "moderate"
+            else:
+                intensity = "easy"
 
-        z1 = minutes.get("z1", 0) or 0
-        z2 = minutes.get("z2", 0) or 0
-        z3 = minutes.get("z3", 0) or 0
-        z4 = minutes.get("z4", 0) or 0
-        z5 = minutes.get("z5", 0) or 0
+            primary_zone_type = "heartrate"
+            hard_minutes = hr_hard
+            moderate_minutes = hr_moderate
+            easy_minutes = hr_easy
 
-        hard_minutes = z4 + z5
-        moderate_minutes = z3
-        easy_minutes = z1 + z2
-
-        if hard_minutes >= 15:
-            intensity = "hard"
+        if intensity == "hard":
             intensity_summary["hard_workout_count"] += 1
-        elif hard_minutes >= 5 or moderate_minutes >= 20:
-            intensity = "moderate"
+        elif intensity == "moderate":
             intensity_summary["moderate_workout_count"] += 1
         else:
-            intensity = "easy"
             intensity_summary["easy_workout_count"] += 1
 
         intensity_summary["workouts"].append({
             "id": activity_id,
-            "name": a.get("name"),
+            "name": name,
             "sport_type": sport,
             "start_date": a.get("start_date"),
-            "zone_type_used": preferred.get("zone_type"),
+            "zone_type_used": primary_zone_type,
             "easy_minutes": round(easy_minutes, 1),
             "moderate_minutes": round(moderate_minutes, 1),
             "hard_minutes": round(hard_minutes, 1),
