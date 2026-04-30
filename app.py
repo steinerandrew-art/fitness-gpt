@@ -79,12 +79,12 @@ def activity_detail(activity_id):
 
 @app.route("/workouts")
 def workouts():
-    activities, error = get_recent_activities(days=14, per_page=25)
+    activities, error = get_recent_activities(days=14, per_page=100)
     if error:
         message, status = error
-      
-        if status == 401:
-            return redirect("/login")  # 👈 key change
+
+        if status == 401 or "Not connected to Strava yet" in str(message):
+            return redirect("/login")
 
         return jsonify({"error": message}), status
 
@@ -228,9 +228,9 @@ def summary():
     activities, error = get_recent_activities(days=14, per_page=100)
     if error:
         message, status = error
-      
-        if status == 401:
-            return redirect("/login")  # 👈 key change
+
+        if status == 401 or "Not connected to Strava yet" in str(message):
+            return redirect("/login")
 
         return jsonify({"error": message}), status
 
@@ -258,7 +258,6 @@ def summary():
 
     if (
         withings_data.get("status") == "not_connected"
-        or withings_data.get("details") == "Not connected to Withings yet"
     ):
         return redirect("/connect/withings")
 
