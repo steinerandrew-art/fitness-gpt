@@ -7,6 +7,7 @@ from strava_client import (
     get_recent_activities,
     get_activity_detail,
     get_activity_zones,
+    get_athlete_zones,
     extract_zone_data,
     exchange_strava_code,
 )
@@ -41,7 +42,7 @@ def login():
         "&response_type=code"
         f"&redirect_uri={REDIRECT_URI}"
         "&approval_prompt=force"
-        "&scope=read,activity:read_all"
+        "&scope=read,activity:read_all,profile:read_all"
     )
     return redirect(auth_url)
 
@@ -447,15 +448,18 @@ def build_intensity_summary(activities):
         if sport in ["VirtualRide", "Ride"]:
             intensity = classify_cycling_intensity(name, power_minutes, hr_minutes)
             primary_zone_type = "power_with_hr_crosscheck"
-            hard_minutes = max(
-                power_minutes["z4"] + power_minutes["z5"],
-                hr_minutes["z4"] + hr_minutes["z5"]
-            )
-            moderate_minutes = max(power_minutes["z3"], hr_minutes["z3"])
-            easy_minutes = max(
-                power_minutes["z1"] + power_minutes["z2"],
-                hr_minutes["z1"] + hr_minutes["z2"]
-            )
+
+            has_power = sum(power_minutes.values()) > 0
+
+            if has_power:
+                hard_minutes = power_minutes["z4"] + power_minutes["z5"]
+                moderate_minutes = power_minutes["z3"]
+                easy_minutes = power_minutes["z1"] + power_minutes["z2"]
+            else:
+                hard_minutes = hr_minutes["z4"] + hr_minutes["z5"]
+                moderate_minutes = hr_minutes["z3"]
+                easy_minutes = hr_minutes["z1"] + hr_minutes["z2"]
+                primary_zone_type = "heartrate"
 
         elif sport == "Run":
             intensity = classify_running_intensity(pace_minutes, hr_minutes)
@@ -487,6 +491,16 @@ def build_intensity_summary(activities):
             moderate_minutes = hr_moderate
             easy_minutes = hr_easy
 
+        zone_total_minutes = easy_minutes + moderate_minutes + hard_minutes
+        moving_minutes = (a.get("moving_time") or 0) / 60
+
+        zone_minutes_check = {
+            "zone_total_minutes": round(zone_total_minutes, 1),
+            "moving_minutes": round(moving_minutes, 1),
+            "difference_minutes": round(zone_total_minutes - moving_minutes, 1),
+            "close_enough": abs(zone_total_minutes - moving_minutes) <= 5
+        }
+        
         if intensity == "hard":
             intensity_summary["hard_workout_count"] += 1
         elif intensity == "moderate":
@@ -503,7 +517,8 @@ def build_intensity_summary(activities):
             "easy_minutes": round(easy_minutes, 1),
             "moderate_minutes": round(moderate_minutes, 1),
             "hard_minutes": round(hard_minutes, 1),
-            "intensity": intensity
+            "intensity": intensity,
+            "zone_minutes_check": zone_minutes_check
         })
 
     return intensity_summary
