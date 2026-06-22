@@ -374,7 +374,7 @@ def has_zone_data(minutes):
 def classify_from_minutes(easy_minutes, moderate_minutes, hard_minutes):
     if hard_minutes >= 15:
         return "hard"
-    if hard_minutes >= 5 or moderate_minutes >= 20:
+    if hard_minutes >= 5 or moderate_minutes >= 15:
         return "moderate"
     return "easy"
 
