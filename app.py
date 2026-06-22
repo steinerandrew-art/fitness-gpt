@@ -18,6 +18,8 @@ from withings_client import (
     WITHINGS_REDIRECT_URI,
 )
 
+from datetime import datetime, timezone
+
 app = Flask(__name__)
 
 @app.route("/")
@@ -76,6 +78,109 @@ def activity_detail(activity_id):
         return jsonify({"error": message}), status
     return jsonify(detail)
 
+BIKE_SPORTS = {"Ride", "VirtualRide"}
+
+def parse_strava_time(value):
+    if not value:
+        return None
+    return datetime.fromisoformat(value.replace("Z", "+00:00"))
+
+def has_power(a):
+    return bool(
+        a.get("average_watts")
+        or a.get("weighted_average_watts")
+        or a.get("device_watts")
+    )
+
+def activity_quality_score(a):
+    score = 0
+    name = (a.get("name") or "").lower()
+
+    if a.get("sport_type") == "VirtualRide":
+        score += 100
+    if "zwift" in name:
+        score += 50
+    if has_power(a):
+        score += 40
+    if (a.get("distance") or 0) > 0:
+        score += 20
+    if (a.get("total_elevation_gain") or 0) > 0:
+        score += 10
+
+    return score
+
+def are_duplicate_bike_activities(a, b):
+    if a.get("sport_type") not in BIKE_SPORTS:
+        return False
+    if b.get("sport_type") not in BIKE_SPORTS:
+        return False
+
+    a_start = parse_strava_time(a.get("start_date"))
+    b_start = parse_strava_time(b.get("start_date"))
+
+    if not a_start or not b_start:
+        return False
+
+    start_diff_s = abs((a_start - b_start).total_seconds())
+    elapsed_diff_s = abs((a.get("elapsed_time") or 0) - (b.get("elapsed_time") or 0))
+
+    a_elapsed = a.get("elapsed_time") or 0
+    b_elapsed = b.get("elapsed_time") or 0
+    longer_elapsed = max(a_elapsed, b_elapsed)
+
+    if longer_elapsed == 0:
+        return False
+
+    duration_close = elapsed_diff_s <= 300 or elapsed_diff_s / longer_elapsed <= 0.15
+
+    a_hr = a.get("average_heartrate")
+    b_hr = b.get("average_heartrate")
+    hr_close = (
+        a_hr is None
+        or b_hr is None
+        or abs(a_hr - b_hr) <= 5
+    )
+
+    return start_diff_s <= 300 and duration_close and hr_close
+
+def dedupe_activities(activities):
+    kept = []
+    removed = []
+
+    for activity in sorted(activities, key=lambda x: x.get("start_date") or ""):
+        matched_index = None
+
+        for i, existing in enumerate(kept):
+            if are_duplicate_bike_activities(activity, existing):
+                matched_index = i
+                break
+
+        if matched_index is None:
+            kept.append(activity)
+            continue
+
+        existing = kept[matched_index]
+
+        if activity_quality_score(activity) > activity_quality_score(existing):
+            kept[matched_index] = activity
+            removed.append({
+                "removed_id": existing.get("id"),
+                "removed_name": existing.get("name"),
+                "kept_id": activity.get("id"),
+                "kept_name": activity.get("name"),
+                "reason": "duplicate bike activity; kept richer activity"
+            })
+        else:
+            removed.append({
+                "removed_id": activity.get("id"),
+                "removed_name": activity.get("name"),
+                "kept_id": existing.get("id"),
+                "kept_name": existing.get("name"),
+                "reason": "duplicate bike activity; kept richer activity"
+            })
+
+    return kept, removed
+
 
 @app.route("/workouts")
 def workouts():
@@ -88,6 +193,8 @@ def workouts():
 
         return jsonify({"error": message}), status
 
+    activities, dedupe_removed = dedupe_activities(activities)
+    
     enriched = []
 
     for a in activities:
@@ -121,7 +228,13 @@ def workouts():
             "zones": zones
         })
 
-    return jsonify({"workouts": enriched})
+    return jsonify({
+    "workouts": enriched,
+    "dedupe": {
+        "removed_count": len(dedupe_removed),
+        "removed": dedupe_removed
+    }
+    })
 
 
 @app.route("/connect/withings")
@@ -325,11 +438,7 @@ def build_intensity_summary(activities):
         sport = a.get("sport_type", "Unknown")
         name = a.get("name")
 
-        zones = {}
-        if activity_id:
-            zones_payload, zones_error = get_activity_zones(activity_id)
-            if not zones_error:
-                zones = extract_zone_data(zones_payload)
+        zones = a.get("zones", {})
 
         power_minutes = get_zone_minutes(zones, "power")
         hr_minutes = get_zone_minutes(zones, "heartrate")
@@ -449,6 +558,19 @@ def summary():
             "status": status
         }), status
 
+    activities, dedupe_removed = dedupe_activities(activities)
+
+    for a in activities:
+        activity_id = a.get("id")
+        zones = {}
+
+        if activity_id:
+            zones_payload, zones_error = get_activity_zones(activity_id)
+            if not zones_error:
+                zones = extract_zone_data(zones_payload)
+
+        a["zones"] = zones
+    
     workout_count = len(activities)
     total_distance_m = sum(a.get("distance", 0) or 0 for a in activities)
     total_moving_time_s = sum(a.get("moving_time", 0) or 0 for a in activities)
@@ -488,7 +610,11 @@ def summary():
         "flags": flags,
         "readiness": "unknown",
         "withings": withings_data,
-        "intensity_summary": intensity_summary
+        "intensity_summary": intensity_summary,
+        "dedupe": {
+            "removed_count": len(dedupe_removed),
+            "removed": dedupe_removed
+        },
     }
 
     summary_data["insights"] = build_coaching_insights(summary_data, withings_data)
