@@ -371,42 +371,11 @@ def zone_sum(minutes, zone_names):
 def has_zone_data(minutes):
     return sum(minutes.values()) > 0
 
-def classify_cycling_intensity(activity_name, power_minutes, hr_minutes):
-    name = (activity_name or "").lower()
-
-    power_hard = zone_sum(power_minutes, ["z4", "z5", "z6", "z7", "z8", "z9", "z10", "z11"])
-    power_moderate = zone_sum(power_minutes, ["z3"])
-
-    hr_hard = zone_sum(hr_minutes, ["z4", "z5"])
-    hr_moderate = zone_sum(hr_minutes, ["z3"])
-
-    # Workout-name clues help when Strava/Zwift power zones are misaligned.
-    name_suggests_hard = any(
-        word in name
-        for word in ["threshold", "interval", "vo2", "anaerobic", "race"]
-    )
-
-    name_suggests_easy = any(
-        word in name
-        for word in ["easy", "zone 2", "z2", "recovery"]
-    )
-
-    # Conservative rule: power alone should not make an easy/zone 2 ride hard.
-    if name_suggests_easy and hr_hard < 10:
-        return "easy"
-
-    if name_suggests_hard and (power_hard >= 10 or hr_hard >= 5):
+def classify_from_minutes(easy_minutes, moderate_minutes, hard_minutes):
+    if hard_minutes >= 15:
         return "hard"
-
-    if hr_hard >= 15:
-        return "hard"
-
-    if power_hard >= 20 and hr_hard >= 5:
-        return "hard"
-
-    if hr_hard >= 5 or hr_moderate >= 20 or power_moderate >= 25:
+    if hard_minutes >= 5 or moderate_minutes >= 20:
         return "moderate"
-
     return "easy"
 
 
@@ -460,37 +429,41 @@ def build_intensity_summary(activities):
                 easy_minutes = zone_sum(hr_minutes, ["z1", "z2"])
                 primary_zone_type = "heartrate"
 
-            intensity = classify_cycling_intensity(name, power_minutes, hr_minutes)
+            intensity = classify_from_minutes(
+                easy_minutes,
+                moderate_minutes,
+                hard_minutes
+            )
 
         elif sport == "Run":
-            intensity = classify_running_intensity(pace_minutes, hr_minutes)
-            primary_zone_type = "pace_with_hr_crosscheck"
-            hard_minutes = max(
-                pace_minutes["z4"] + pace_minutes["z5"],
-                hr_minutes["z4"] + hr_minutes["z5"]
-            )
-            moderate_minutes = max(pace_minutes["z3"], hr_minutes["z3"])
-            easy_minutes = max(
-                pace_minutes["z1"] + pace_minutes["z2"],
-                hr_minutes["z1"] + hr_minutes["z2"]
+            if has_zone_data(pace_minutes):
+                primary_zone_type = "pace"
+                easy_minutes = zone_sum(pace_minutes, ["z1", "z2"])
+                moderate_minutes = zone_sum(pace_minutes, ["z3"])
+                hard_minutes = zone_sum(pace_minutes, ["z4", "z5", "z6"])
+            else:
+                primary_zone_type = "heartrate"
+                easy_minutes = zone_sum(hr_minutes, ["z1", "z2"])
+                moderate_minutes = zone_sum(hr_minutes, ["z3"])
+                hard_minutes = zone_sum(hr_minutes, ["z4", "z5"])
+
+            intensity = classify_from_minutes(
+                easy_minutes,
+                moderate_minutes,
+                hard_minutes
             )
 
         else:
-            hr_hard = hr_minutes["z4"] + hr_minutes["z5"]
-            hr_moderate = hr_minutes["z3"]
-            hr_easy = hr_minutes["z1"] + hr_minutes["z2"]
-
-            if hr_hard >= 15:
-                intensity = "hard"
-            elif hr_hard >= 5 or hr_moderate >= 20:
-                intensity = "moderate"
-            else:
-                intensity = "easy"
-
             primary_zone_type = "heartrate"
-            hard_minutes = hr_hard
-            moderate_minutes = hr_moderate
-            easy_minutes = hr_easy
+            easy_minutes = zone_sum(hr_minutes, ["z1", "z2"])
+            moderate_minutes = zone_sum(hr_minutes, ["z3"])
+            hard_minutes = zone_sum(hr_minutes, ["z4", "z5"])
+
+            intensity = classify_from_minutes(
+                easy_minutes,
+                moderate_minutes,
+                hard_minutes
+            )
 
         zone_total_minutes = easy_minutes + moderate_minutes + hard_minutes
         moving_minutes = (a.get("moving_time") or 0) / 60

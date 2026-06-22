@@ -26,7 +26,6 @@ def get_cycling_power_zones(ftp_watts=CYCLING_FTP_WATTS):
         {"zone": "z7", "name": "neuromuscular", "min": 1.50 * ftp_watts, "max": None},
     ]
 
-
 def classify_power_watts(watts, ftp_watts=CYCLING_FTP_WATTS):
     """
     Classifies a watt value into an FTP-based zone.
@@ -43,7 +42,6 @@ def classify_power_watts(watts, ftp_watts=CYCLING_FTP_WATTS):
             return zone
 
     return None
-
 
 def power_zone_to_intensity(zone_name):
     """
@@ -124,68 +122,5 @@ def summarize_power_stream_intensity(streams_payload, ftp_watts=CYCLING_FTP_WATT
     result["easy_minutes"] = round(result["details"]["easy_seconds"] / 60, 1)
     result["moderate_minutes"] = round(result["details"]["moderate_seconds"] / 60, 1)
     result["hard_minutes"] = round(result["details"]["hard_seconds"] / 60, 1)
-
-    return result
-
-
-def summarize_power_bucket_intensity(power_zone_data, ftp_watts=CYCLING_FTP_WATTS):
-    """
-    Converts Strava's activity power distribution buckets into easy/moderate/hard minutes.
-
-    Important:
-    Strava activity power buckets may be fixed wattage buckets, not FTP zones.
-    This function uses each bucket's watt range midpoint and maps it into FTP-based zones.
-    """
-    result = {
-        "easy_minutes": 0,
-        "moderate_minutes": 0,
-        "hard_minutes": 0,
-        "source": "ftp_based_power_bucket_midpoints",
-        "ftp_watts": ftp_watts,
-        "details": []
-    }
-
-    bounds = power_zone_data.get("bounds", []) or {}
-    seconds_by_zone = power_zone_data.get("seconds", {}) or {}
-
-    for bucket in bounds:
-        bucket_name = bucket.get("zone")
-        bucket_min = bucket.get("min")
-        bucket_max = bucket.get("max")
-        seconds = seconds_by_zone.get(bucket_name, 0) or 0
-
-        if bucket_min is None or bucket_max is None or bucket_max == -1:
-            continue
-
-        midpoint_watts = (bucket_min + bucket_max) / 2
-        ftp_zone = classify_power_watts(midpoint_watts, ftp_watts)
-
-        if not ftp_zone:
-            continue
-
-        intensity = power_zone_to_intensity(ftp_zone["zone"])
-        minutes = seconds / 60
-
-        if intensity == "easy":
-            result["easy_minutes"] += minutes
-        elif intensity == "moderate":
-            result["moderate_minutes"] += minutes
-        elif intensity == "hard":
-            result["hard_minutes"] += minutes
-
-        result["details"].append({
-            "strava_bucket": bucket_name,
-            "bucket_min": bucket_min,
-            "bucket_max": bucket_max,
-            "midpoint_watts": round(midpoint_watts, 1),
-            "ftp_zone": ftp_zone["zone"],
-            "ftp_zone_name": ftp_zone["name"],
-            "intensity": intensity,
-            "minutes": round(minutes, 1),
-        })
-
-    result["easy_minutes"] = round(result["easy_minutes"], 1)
-    result["moderate_minutes"] = round(result["moderate_minutes"], 1)
-    result["hard_minutes"] = round(result["hard_minutes"], 1)
 
     return result
