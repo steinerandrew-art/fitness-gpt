@@ -7,10 +7,13 @@ from strava_client import (
     get_recent_activities,
     get_activity_detail,
     get_activity_zones,
+    get_activity_streams,
     get_athlete_zones,
     extract_zone_data,
     exchange_strava_code,
 )
+
+from training_zones import summarize_power_stream_intensity
 
 from withings_client import (
     get_withings_summary,
@@ -443,20 +446,21 @@ def build_intensity_summary(activities):
         pace_minutes = get_zone_minutes(zones, "pace")
 
         if sport in ["VirtualRide", "Ride"]:
-            intensity = classify_cycling_intensity(name, power_minutes, hr_minutes)
-            primary_zone_type = "power_with_hr_crosscheck"
+            stream_power = a.get("power_stream_intensity", {})
+            has_stream_power = stream_power.get("has_power_stream", False)
 
-            has_power = sum(power_minutes.values()) > 0
-
-            if has_power:
-                easy_minutes = zone_sum(power_minutes, ["z1", "z2"])
-                moderate_minutes = zone_sum(power_minutes, ["z3"])
-                hard_minutes = zone_sum(power_minutes, ["z4", "z5", "z6", "z7", "z8", "z9", "z10", "z11"])
+            if has_stream_power:
+                easy_minutes = stream_power.get("easy_minutes", 0)
+                moderate_minutes = stream_power.get("moderate_minutes", 0)
+                hard_minutes = stream_power.get("hard_minutes", 0)
+                primary_zone_type = "ftp_power_streams"
             else:
                 hard_minutes = zone_sum(hr_minutes, ["z4", "z5"])
                 moderate_minutes = zone_sum(hr_minutes, ["z3"])
                 easy_minutes = zone_sum(hr_minutes, ["z1", "z2"])
                 primary_zone_type = "heartrate"
+
+            intensity = classify_cycling_intensity(name, power_minutes, hr_minutes)
 
         elif sport == "Run":
             intensity = classify_running_intensity(pace_minutes, hr_minutes)
@@ -582,6 +586,11 @@ def summary():
                 zones = extract_zone_data(zones_payload)
 
         a["zones"] = zones
+
+        if a.get("sport_type") in ["Ride", "VirtualRide"]:
+            streams_payload, streams_error = get_activity_streams(activity_id)
+            if not streams_error:
+                a["power_stream_intensity"] = summarize_power_stream_intensity(streams_payload)
     
     workout_count = len(activities)
     total_distance_m = sum(a.get("distance", 0) or 0 for a in activities)

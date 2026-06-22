@@ -136,6 +136,26 @@ def get_activity_zones(activity_id):
 
     return response.json(), None
 
+def get_activity_streams(activity_id):
+    access_token = ensure_access_token()
+    if not access_token:
+        return None, ("Not connected to Strava yet", 401)
+
+    response = requests.get(
+        f"https://www.strava.com/api/v3/activities/{activity_id}/streams",
+        headers={"Authorization": f"Bearer {access_token}"},
+        params={
+            "keys": "time,watts,moving",
+            "key_by_type": "true",
+        },
+        timeout=30,
+    )
+
+    if response.status_code != 200:
+        return None, (response.text, response.status_code)
+
+    return response.json(), None
+
 def get_athlete_zones():
     access_token = ensure_access_token()
     if not access_token:
