@@ -360,25 +360,22 @@ def summarize_zone_minutes(zones, preferred_types):
 
 def get_zone_minutes(zones, zone_type):
     zone_data = zones.get(zone_type, {})
-    minutes = zone_data.get("minutes", {}) or {}
+    return zone_data.get("minutes", {}) or {}
 
-    return {
-        "z1": minutes.get("z1", 0) or 0,
-        "z2": minutes.get("z2", 0) or 0,
-        "z3": minutes.get("z3", 0) or 0,
-        "z4": minutes.get("z4", 0) or 0,
-        "z5": minutes.get("z5", 0) or 0,
-    }
+def zone_sum(minutes, zone_names):
+    return sum(minutes.get(z, 0) or 0 for z in zone_names)
 
+def has_zone_data(minutes):
+    return sum(minutes.values()) > 0
 
 def classify_cycling_intensity(activity_name, power_minutes, hr_minutes):
     name = (activity_name or "").lower()
 
-    power_hard = power_minutes["z4"] + power_minutes["z5"]
-    power_moderate = power_minutes["z3"]
+    power_hard = zone_sum(power_minutes, ["z4", "z5", "z6", "z7", "z8", "z9", "z10", "z11"])
+    power_moderate = zone_sum(power_minutes, ["z3"])
 
-    hr_hard = hr_minutes["z4"] + hr_minutes["z5"]
-    hr_moderate = hr_minutes["z3"]
+    hr_hard = zone_sum(hr_minutes, ["z4", "z5"])
+    hr_moderate = zone_sum(hr_minutes, ["z3"])
 
     # Workout-name clues help when Strava/Zwift power zones are misaligned.
     name_suggests_hard = any(
@@ -452,13 +449,13 @@ def build_intensity_summary(activities):
             has_power = sum(power_minutes.values()) > 0
 
             if has_power:
-                hard_minutes = power_minutes["z4"] + power_minutes["z5"]
-                moderate_minutes = power_minutes["z3"]
-                easy_minutes = power_minutes["z1"] + power_minutes["z2"]
+                easy_minutes = zone_sum(power_minutes, ["z1", "z2"])
+                moderate_minutes = zone_sum(power_minutes, ["z3"])
+                hard_minutes = zone_sum(power_minutes, ["z4", "z5", "z6", "z7", "z8", "z9", "z10", "z11"])
             else:
-                hard_minutes = hr_minutes["z4"] + hr_minutes["z5"]
-                moderate_minutes = hr_minutes["z3"]
-                easy_minutes = hr_minutes["z1"] + hr_minutes["z2"]
+                hard_minutes = zone_sum(hr_minutes, ["z4", "z5"])
+                moderate_minutes = zone_sum(hr_minutes, ["z3"])
+                easy_minutes = zone_sum(hr_minutes, ["z1", "z2"])
                 primary_zone_type = "heartrate"
 
         elif sport == "Run":
