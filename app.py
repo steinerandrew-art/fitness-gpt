@@ -602,7 +602,15 @@ def summary():
     
     intensity_summary = build_intensity_summary(activities)
 
-    withings_data = get_withings_summary()
+    try:
+        withings_data = get_withings_summary()
+    except Exception as exc:
+        app.logger.exception("Withings summary failed")
+        withings_data = {
+            "status": "temporarily_unavailable",
+            "message": "Withings could not be accessed. Coaching is based on Strava data only.",
+            "error_type": type(exc).__name__,
+        }
 
     withings_status = withings_data.get("status", "temporarily_unavailable")
 
@@ -616,7 +624,7 @@ def summary():
         missing_sources = ["withings"]
 
     summary_data = {
-        "debug_version": "intensity-summary-v2",
+        "debug_version": "multiuser-step4b-withings-isolated",
         "period_days": 14,
         "workout_count": workout_count,
         "total_distance_km": total_distance_km,
