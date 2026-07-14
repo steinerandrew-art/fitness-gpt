@@ -8,24 +8,59 @@ redis = Redis(
 )
 
 
-def get_token(service, key):
+DEFAULT_USER_ID = os.getenv("DEFAULT_USER_ID", "default")
+
+
+def build_token_key(user_id, service, key):
+    return f"fitness:user:{user_id}:service:{service}:{key}"
+
+
+def get_legacy_token(service, key):
+    """
+    Reads tokens stored using the old single-user key format.
+
+    Example old key:
+        strava:access_token
+    """
     return redis.get(f"{service}:{key}")
 
 
-def set_token(service, key, value):
+def get_token(service, key, user_id=DEFAULT_USER_ID):
+    """
+    Reads a token using the new user-specific key format.
+
+    If the token has not yet been migrated, this temporarily falls back
+    to the old single-user key.
+    """
+    redis_key = build_token_key(user_id, service, key)
+    value = redis.get(redis_key)
+
     if value is not None:
-        redis.set(f"{service}:{key}", value)
+        return value
+
+    return get_legacy_token(service, key)
 
 
-def get_service_tokens(service):
+def set_token(service, key, value, user_id=DEFAULT_USER_ID):
+    """
+    Saves a token using the new user-specific key format.
+    """
+    if value is None:
+        return
+
+    redis_key = build_token_key(user_id, service, key)
+    redis.set(redis_key, value)
+
+
+def get_service_tokens(service, user_id=DEFAULT_USER_ID):
     return {
-        "access_token": get_token(service, "access_token"),
-        "refresh_token": get_token(service, "refresh_token"),
-        "expires_at": get_token(service, "expires_at"),
-        "userid": get_token(service, "userid"),
+        "access_token": get_token(service, "access_token", user_id),
+        "refresh_token": get_token(service, "refresh_token", user_id),
+        "expires_at": get_token(service, "expires_at", user_id),
+        "userid": get_token(service, "userid", user_id),
     }
 
 
-def save_service_tokens(service, tokens):
+def save_service_tokens(service, tokens, user_id=DEFAULT_USER_ID):
     for key, value in tokens.items():
-        set_token(service, key, value)
+        set_token(service, key, value, user_id)
