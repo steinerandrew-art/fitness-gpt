@@ -1,19 +1,36 @@
 import os
 import time
 from datetime import datetime, timedelta, timezone
-from token_store import get_service_tokens, save_service_tokens
 
 import requests
+
+from token_store import (
+    DEFAULT_USER_ID,
+    get_service_tokens,
+    save_service_tokens,
+)
 
 
 CLIENT_ID = os.environ["STRAVA_CLIENT_ID"]
 CLIENT_SECRET = os.environ["STRAVA_CLIENT_SECRET"]
 REDIRECT_URI = os.environ["REDIRECT_URI"]
 
-tokens = get_service_tokens("strava")
+
+def get_strava_tokens(user_id=DEFAULT_USER_ID):
+    """
+    Loads the latest Strava tokens for the requested user from Redis.
+
+    Tokens are loaded when needed instead of once when the module starts.
+    """
+    return get_service_tokens("strava", user_id)
 
 
-def exchange_strava_code(code):
+# Temporary compatibility object used only by the existing app.py
+# callback response. API requests below do not rely on this global object.
+tokens = get_strava_tokens()
+
+
+def exchange_strava_code(code, user_id=DEFAULT_USER_ID):
     response = requests.post(
         "https://www.strava.com/oauth/token",
         data={
@@ -30,16 +47,32 @@ def exchange_strava_code(code):
 
     token_data = response.json()
 
-    tokens["access_token"] = token_data["access_token"]
-    tokens["refresh_token"] = token_data["refresh_token"]
-    tokens["expires_at"] = token_data["expires_at"]
-    tokens["athlete"] = token_data.get("athlete", {})
-    save_service_tokens("strava", tokens)
+    tokens = {
+        "access_token": token_data["access_token"],
+        "refresh_token": token_data["refresh_token"],
+        "expires_at": token_data["expires_at"],
+    }
+
+    athlete = token_data.get("athlete", {})
+    if athlete:
+        tokens["athlete_id"] = athlete.get("id")
+        tokens["athlete_firstname"] = athlete.get("firstname")
+        tokens["athlete_lastname"] = athlete.get("lastname")
+
+    save_service_tokens("strava", tokens, user_id)
+
+    # Keep the existing app.py callback response working during this
+    # transitional step. Later, app.py will read the user directly.
+    if user_id == DEFAULT_USER_ID:
+        globals()["tokens"].clear()
+        globals()["tokens"].update(tokens)
 
     return token_data, None
 
 
-def ensure_access_token():
+def ensure_access_token(user_id=DEFAULT_USER_ID):
+    tokens = get_strava_tokens(user_id)
+
     access_token = tokens.get("access_token")
     refresh_token = tokens.get("refresh_token")
     expires_at = tokens.get("expires_at", 0)
@@ -70,16 +103,20 @@ def ensure_access_token():
         return None
 
     token_data = response.json()
-    tokens["access_token"] = token_data["access_token"]
-    tokens["refresh_token"] = token_data["refresh_token"]
-    tokens["expires_at"] = token_data["expires_at"]
-    save_service_tokens("strava", tokens)
 
-    return tokens["access_token"]
+    refreshed_tokens = {
+        "access_token": token_data["access_token"],
+        "refresh_token": token_data["refresh_token"],
+        "expires_at": token_data["expires_at"],
+    }
+
+    save_service_tokens("strava", refreshed_tokens, user_id)
+
+    return refreshed_tokens["access_token"]
 
 
-def get_recent_activities(days=14, per_page=100):
-    access_token = ensure_access_token()
+def get_recent_activities(days=14, per_page=100, user_id=DEFAULT_USER_ID):
+    access_token = ensure_access_token(user_id)
     if not access_token:
         return None, ("Not connected to Strava yet", 401)
 
@@ -103,8 +140,8 @@ def get_recent_activities(days=14, per_page=100):
     return response.json(), None
 
 
-def get_activity_detail(activity_id):
-    access_token = ensure_access_token()
+def get_activity_detail(activity_id, user_id=DEFAULT_USER_ID):
+    access_token = ensure_access_token(user_id)
     if not access_token:
         return None, ("Not connected to Strava yet", 401)
 
@@ -120,8 +157,8 @@ def get_activity_detail(activity_id):
     return response.json(), None
 
 
-def get_activity_zones(activity_id):
-    access_token = ensure_access_token()
+def get_activity_zones(activity_id, user_id=DEFAULT_USER_ID):
+    access_token = ensure_access_token(user_id)
     if not access_token:
         return None, ("Not connected to Strava yet", 401)
 
@@ -136,8 +173,9 @@ def get_activity_zones(activity_id):
 
     return response.json(), None
 
-def get_activity_streams(activity_id):
-    access_token = ensure_access_token()
+
+def get_activity_streams(activity_id, user_id=DEFAULT_USER_ID):
+    access_token = ensure_access_token(user_id)
     if not access_token:
         return None, ("Not connected to Strava yet", 401)
 
@@ -156,8 +194,9 @@ def get_activity_streams(activity_id):
 
     return response.json(), None
 
-def get_athlete_zones():
-    access_token = ensure_access_token()
+
+def get_athlete_zones(user_id=DEFAULT_USER_ID):
+    access_token = ensure_access_token(user_id)
     if not access_token:
         return None, ("Not connected to Strava yet", 401)
 
@@ -171,6 +210,7 @@ def get_athlete_zones():
         return None, (response.text, response.status_code)
 
     return response.json(), None
+
 
 def extract_zone_data(zones_payload):
     zone_summary = {}
