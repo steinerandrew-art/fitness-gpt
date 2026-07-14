@@ -304,34 +304,42 @@ def build_coaching_insights(summary_data, withings_data):
             "Training mix is diversified across multiple activity types."
         )
 
-    trends = withings_data.get("trends", {})
-    smoothed_weight_change = trends.get("weight_change_smoothed_lb")
+    withings_status = withings_data.get("status")
 
-    if smoothed_weight_change is not None:
-        if abs(smoothed_weight_change) < 1:
+    if withings_status == "connected":
+        trends = withings_data.get("trends", {})
+        smoothed_weight_change = trends.get("weight_change_smoothed_lb")
+
+        if smoothed_weight_change is not None:
+            if abs(smoothed_weight_change) < 1:
+                insights.append(
+                    f"Smoothed weight trend is stable at {smoothed_weight_change:+.1f} lb."
+                )
+            elif smoothed_weight_change > 0:
+                insights.append(
+                    f"Smoothed weight trend is up {smoothed_weight_change:+.1f} lb; consider hydration, sodium, soreness, and training load before treating it as tissue gain."
+                )
+            else:
+                insights.append(
+                    f"Smoothed weight trend is down {smoothed_weight_change:+.1f} lb; watch whether energy and workout quality remain strong."
+                )
+
+        latest = withings_data.get("latest") or {}
+        measurements = latest.get("measurements", {})
+
+        if measurements.get("weight_lb") is not None:
             insights.append(
-                f"Smoothed weight trend is stable at {smoothed_weight_change:+.1f} lb."
-            )
-        elif smoothed_weight_change > 0:
-            insights.append(
-                f"Smoothed weight trend is up {smoothed_weight_change:+.1f} lb; consider hydration, sodium, soreness, and training load before treating it as tissue gain."
-            )
-        else:
-            insights.append(
-                f"Smoothed weight trend is down {smoothed_weight_change:+.1f} lb; watch whether energy and workout quality remain strong."
+                f"Latest weight is {measurements.get('weight_lb')} lb."
             )
 
-    latest = withings_data.get("latest", {})
-    measurements = latest.get("measurements", {})
+        if measurements.get("fat_ratio_pct") is not None:
+            insights.append(
+                f"Latest body fat estimate is {measurements.get('fat_ratio_pct')}%, which should be treated as directional rather than exact."
+            )
 
-    if measurements.get("weight_lb") is not None:
+    elif withings_status in {"not_connected", "temporarily_unavailable"}:
         insights.append(
-            f"Latest weight is {measurements.get('weight_lb')} lb."
-        )
-
-    if measurements.get("fat_ratio_pct") is not None:
-        insights.append(
-            f"Latest body fat estimate is {measurements.get('fat_ratio_pct')}%, which should be treated as directional rather than exact."
+            "Withings data was unavailable, so coaching is based on Strava data only."
         )
 
     if not insights:
@@ -507,7 +515,14 @@ def calculate_readiness(summary_data, withings_data):
     if "high_training_volume" in flags:
         reasons.append("Training volume is elevated, but this is interpreted cautiously because daily activity is normal for you.")
 
-    weight_change = withings_data.get("trends", {}).get("weight_change_smoothed_lb")
+    weight_change = None
+
+    if withings_data.get("status") == "connected":
+        weight_change = (
+            withings_data
+            .get("trends", {})
+            .get("weight_change_smoothed_lb")
+        )
 
     if weight_change is not None:
         if abs(weight_change) < 1:
@@ -589,8 +604,16 @@ def summary():
 
     withings_data = get_withings_summary()
 
-    if withings_data.get("status") == "not_connected":
-        return redirect("/connect/withings")
+    withings_status = withings_data.get("status", "temporarily_unavailable")
+
+    if withings_status == "connected":
+        coaching_basis = ["strava", "withings"]
+        assessment_level = "complete"
+        missing_sources = []
+    else:
+        coaching_basis = ["strava"]
+        assessment_level = "partial"
+        missing_sources = ["withings"]
 
     summary_data = {
         "debug_version": "intensity-summary-v2",
@@ -604,6 +627,16 @@ def summary():
         "flags": flags,
         "readiness": "unknown",
         "withings": withings_data,
+        "data_availability": {
+            "strava": "connected",
+            "withings": withings_status,
+            "coaching_basis": coaching_basis,
+        },
+        "assessment_completeness": {
+            "level": assessment_level,
+            "available_sources": coaching_basis,
+            "missing_sources": missing_sources,
+        },
         "intensity_summary": intensity_summary,
         "dedupe": {
             "removed_count": len(dedupe_removed),
