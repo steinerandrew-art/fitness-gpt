@@ -1,3 +1,5 @@
+import os
+
 from flask import Flask, jsonify, redirect, request
 
 from strava_client import (
@@ -602,15 +604,33 @@ def summary():
     
     intensity_summary = build_intensity_summary(activities)
 
-    try:
-        withings_data = get_withings_summary()
-    except Exception as exc:
-        app.logger.exception("Withings summary failed")
+    simulate_withings_failure = (
+        os.getenv("SIMULATE_WITHINGS_FAILURE", "false").lower() == "true"
+    )
+
+    if simulate_withings_failure:
         withings_data = {
             "status": "temporarily_unavailable",
-            "message": "Withings could not be accessed. Coaching is based on Strava data only.",
-            "error_type": type(exc).__name__,
+            "message": (
+                "Withings access is being intentionally disabled for testing. "
+                "Coaching is based on Strava data only."
+            ),
         }
+    else:
+        try:
+            withings_data = get_withings_summary()
+        except Exception as exc:
+            app.logger.exception("Withings summary failed")
+            withings_data = {
+                "status": "temporarily_unavailable",
+                "message": (
+                    "Withings could not be accessed. "
+                    "Coaching is based on Strava data only."
+                ),
+                "error_type": type(exc).__name__,
+            }
+
+    withings_status = withings_data.get("status", "temporarily_unavailable")
 
     withings_status = withings_data.get("status", "temporarily_unavailable")
 
