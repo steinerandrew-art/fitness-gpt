@@ -38,7 +38,13 @@ def get_token(service, key, user_id=DEFAULT_USER_ID):
     if value is not None:
         return value
 
-    return get_legacy_token(service, key)
+    # Legacy single-user keys belong only to the configured default user.
+    # Without this check, a newly added user with no stored tokens could
+    # accidentally inherit the default user's Strava or Withings account.
+    if user_id == DEFAULT_USER_ID:
+        return get_legacy_token(service, key)
+
+    return None
 
 
 def set_token(service, key, value, user_id=DEFAULT_USER_ID):
