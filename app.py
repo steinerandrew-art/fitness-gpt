@@ -1,11 +1,15 @@
+import base64
+import hashlib
+import hmac
+import json
 import os
+import time
 
 from flask import Flask, jsonify, redirect, request
 
 from strava_client import (
     CLIENT_ID,
     REDIRECT_URI,
-    tokens,
     get_recent_activities,
     get_activity_detail,
     get_activity_zones,
@@ -25,22 +29,151 @@ from withings_client import (
 )
 
 from datetime import datetime, timezone
+from functools import wraps
+
+from token_store import DEFAULT_USER_ID
 
 app = Flask(__name__)
+
+
+def configured_api_users():
+    """Return an API-key-to-user-ID mapping from Render variables."""
+    users = {}
+
+    default_key = os.getenv("FITNESS_API_KEY_ANDREW")
+    if default_key:
+        users[default_key] = DEFAULT_USER_ID
+
+    second_user_id = os.getenv("SECOND_USER_ID")
+    second_user_key = os.getenv("FITNESS_API_KEY_SECOND_USER")
+    if second_user_id and second_user_key:
+        users[second_user_key] = second_user_id
+
+    return users
+
+
+def user_id_for_api_key(api_key):
+    if not api_key:
+        return None
+
+    for configured_key, user_id in configured_api_users().items():
+        if hmac.compare_digest(api_key, configured_key):
+            return user_id
+
+    return None
+
+
+def api_key_from_request():
+    authorization = request.headers.get("Authorization", "")
+    if authorization.startswith("Bearer "):
+        return authorization[7:].strip()
+
+    return request.headers.get("X-API-Key")
+
+
+def require_api_user(view_function):
+    @wraps(view_function)
+    def wrapped(*args, **kwargs):
+        user_id = user_id_for_api_key(api_key_from_request())
+        if not user_id:
+            return jsonify({
+                "error": "Valid API key required",
+                "authentication": "Send Authorization: Bearer <API key>"
+            }), 401
+
+        return view_function(user_id, *args, **kwargs)
+
+    return wrapped
+
+
+def oauth_state_secret():
+    secret = os.getenv("OAUTH_STATE_SECRET")
+    if not secret:
+        raise RuntimeError("OAUTH_STATE_SECRET is not configured")
+    return secret.encode("utf-8")
+
+
+def create_oauth_state(user_id, service):
+    payload = {
+        "user_id": user_id,
+        "service": service,
+        "issued_at": int(time.time()),
+    }
+    payload_bytes = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+    encoded_payload = base64.urlsafe_b64encode(payload_bytes).decode("ascii").rstrip("=")
+    signature = hmac.new(
+        oauth_state_secret(),
+        encoded_payload.encode("ascii"),
+        hashlib.sha256,
+    ).hexdigest()
+    return f"{encoded_payload}.{signature}"
+
+
+def read_oauth_state(state, expected_service):
+    if not state or "." not in state:
+        return None
+
+    encoded_payload, supplied_signature = state.rsplit(".", 1)
+    expected_signature = hmac.new(
+        oauth_state_secret(),
+        encoded_payload.encode("ascii"),
+        hashlib.sha256,
+    ).hexdigest()
+
+    if not hmac.compare_digest(supplied_signature, expected_signature):
+        return None
+
+    padded_payload = encoded_payload + "=" * (-len(encoded_payload) % 4)
+    try:
+        payload = json.loads(base64.urlsafe_b64decode(padded_payload).decode("utf-8"))
+    except (ValueError, json.JSONDecodeError):
+        return None
+
+    if payload.get("service") != expected_service:
+        return None
+
+    issued_at = payload.get("issued_at", 0)
+    if not isinstance(issued_at, int) or time.time() - issued_at > 900:
+        return None
+
+    user_id = payload.get("user_id")
+    if user_id not in configured_api_users().values():
+        return None
+
+    return user_id
+
+
+def connection_form(service_name, action_path):
+    return f"""
+    <h1>Connect {service_name}</h1>
+    <p>Enter the API key assigned to the user whose {service_name} account is being connected.</p>
+    <form method="post" action="{action_path}">
+      <label>API key: <input type="password" name="api_key" required></label>
+      <button type="submit">Continue to {service_name}</button>
+    </form>
+    """
 
 @app.route("/")
 def home():
     return """
     <h1>Fitness GPT backend is running</h1>
-    <p><a href="/login">Connect Strava</a></p>
-    <p><a href="/connect/withings">Connect Withings</a></p>
+    <p><a href="/login">Connect Strava for a user</a></p>
+    <p><a href="/connect/withings">Connect Withings for a user</a></p>
     <p><a href="/workouts">View workouts</a></p>
     <p><a href="/summary">View summary</a></p>
     """
 
 
-@app.route("/login")
+@app.route("/login", methods=["GET", "POST"])
 def login():
+    if request.method == "GET":
+        return connection_form("Strava", "/login")
+
+    user_id = user_id_for_api_key(request.form.get("api_key"))
+    if not user_id:
+        return "Invalid API key", 401
+
+    state = create_oauth_state(user_id, "strava")
     auth_url = (
         "https://www.strava.com/oauth/authorize"
         f"?client_id={CLIENT_ID}"
@@ -48,6 +181,7 @@ def login():
         f"&redirect_uri={REDIRECT_URI}"
         "&approval_prompt=force"
         "&scope=read,activity:read_all,profile:read_all"
+        f"&state={state}"
     )
     return redirect(auth_url)
 
@@ -56,6 +190,10 @@ def login():
 def exchange_token():
     code = request.args.get("code")
     error = request.args.get("error")
+    user_id = read_oauth_state(request.args.get("state"), "strava")
+
+    if not user_id:
+        return "Invalid or expired OAuth state", 400
 
     if error:
         return f"Authorization failed: {error}", 400
@@ -63,7 +201,7 @@ def exchange_token():
     if not code:
         return "Missing authorization code", 400
 
-    token_data, error = exchange_strava_code(code)
+    token_data, error = exchange_strava_code(code, user_id=user_id)
 
     if error:
         message, status = error
@@ -71,14 +209,16 @@ def exchange_token():
 
     return jsonify({
         "message": "Strava connected successfully",
-        "athlete": tokens.get("athlete", {}),
-        "expires_at": tokens.get("expires_at")
+        "user_id": user_id,
+        "athlete": token_data.get("athlete", {}),
+        "expires_at": token_data.get("expires_at")
     })
 
 
 @app.route("/activity/<int:activity_id>")
-def activity_detail(activity_id):
-    detail, error = get_activity_detail(activity_id)
+@require_api_user
+def activity_detail(user_id, activity_id):
+    detail, error = get_activity_detail(activity_id, user_id=user_id)
     if error:
         message, status = error
         return jsonify({"error": message}), status
@@ -189,13 +329,14 @@ def dedupe_activities(activities):
 
 
 @app.route("/workouts")
-def workouts():
-    activities, error = get_recent_activities(days=14, per_page=100)
+@require_api_user
+def workouts(user_id):
+    activities, error = get_recent_activities(days=14, per_page=100, user_id=user_id)
     if error:
         message, status = error
 
         if status == 401 or "Not connected to Strava yet" in str(message):
-            return redirect("/login")
+            return jsonify({"error": "Strava is not connected for this user"}), 401
 
         return jsonify({"error": message}), status
 
@@ -208,7 +349,7 @@ def workouts():
         zones = {}
 
         if activity_id:
-            zones_payload, zones_error = get_activity_zones(activity_id)
+            zones_payload, zones_error = get_activity_zones(activity_id, user_id=user_id)
             if not zones_error:
                 zones = extract_zone_data(zones_payload)
 
@@ -243,15 +384,23 @@ def workouts():
     })
 
 
-@app.route("/connect/withings")
+@app.route("/connect/withings", methods=["GET", "POST"])
 def connect_withings():
+    if request.method == "GET":
+        return connection_form("Withings", "/connect/withings")
+
+    user_id = user_id_for_api_key(request.form.get("api_key"))
+    if not user_id:
+        return "Invalid API key", 401
+
+    state = create_oauth_state(user_id, "withings")
     auth_url = (
         "https://account.withings.com/oauth2_user/authorize2"
         "?response_type=code"
         f"&client_id={WITHINGS_CLIENT_ID}"
         f"&redirect_uri={WITHINGS_REDIRECT_URI}"
         "&scope=user.info,user.metrics"
-        "&state=withings"
+        f"&state={state}"
     )
     return redirect(auth_url)
 
@@ -260,6 +409,10 @@ def connect_withings():
 def callback_withings():
     code = request.args.get("code")
     error = request.args.get("error")
+    user_id = read_oauth_state(request.args.get("state"), "withings")
+
+    if not user_id:
+        return "Invalid or expired OAuth state", 400
 
     if error:
         return f"Withings authorization failed: {error}", 400
@@ -267,7 +420,7 @@ def callback_withings():
     if not code:
         return "Missing Withings authorization code", 400
 
-    token_data, token_error = exchange_withings_code(code)
+    token_data, token_error = exchange_withings_code(code, user_id=user_id)
 
     if token_error:
         message, status = token_error
@@ -278,6 +431,7 @@ def callback_withings():
 
     return jsonify({
         "message": "Withings connected successfully",
+        "user_id": user_id,
         "userid": token_data.get("userid"),
         "expires_in": token_data.get("expires_in")
     })
@@ -551,13 +705,14 @@ def calculate_readiness(summary_data, withings_data):
 
 
 @app.route("/summary")
-def summary():
-    activities, error = get_recent_activities(days=14, per_page=100)
+@require_api_user
+def summary(user_id):
+    activities, error = get_recent_activities(days=14, per_page=100, user_id=user_id)
     if error:
         message, status = error
 
         if status == 401:
-            return redirect("/login")
+            return jsonify({"error": "Strava is not connected for this user"}), 401
 
         return jsonify({
             "error": message,
@@ -571,14 +726,14 @@ def summary():
         zones = {}
 
         if activity_id:
-            zones_payload, zones_error = get_activity_zones(activity_id)
+            zones_payload, zones_error = get_activity_zones(activity_id, user_id=user_id)
             if not zones_error:
                 zones = extract_zone_data(zones_payload)
 
         a["zones"] = zones
 
         if a.get("sport_type") in ["Ride", "VirtualRide"]:
-            streams_payload, streams_error = get_activity_streams(activity_id)
+            streams_payload, streams_error = get_activity_streams(activity_id, user_id=user_id)
             if not streams_error:
                 a["power_stream_intensity"] = summarize_power_stream_intensity(streams_payload)
     
@@ -618,19 +773,14 @@ def summary():
         }
     else:
         try:
-            withings_data = get_withings_summary()
+            withings_data = get_withings_summary(user_id=user_id)
         except Exception as exc:
-            app.logger.exception("Withings summary failed")
+            app.logger.exception("Withings summary failed for user %s", user_id)
             withings_data = {
                 "status": "temporarily_unavailable",
-                "message": (
-                    "Withings could not be accessed. "
-                    "Coaching is based on Strava data only."
-                ),
+                "message": "Withings could not be accessed. Coaching is based on Strava data only.",
                 "error_type": type(exc).__name__,
             }
-
-    withings_status = withings_data.get("status", "temporarily_unavailable")
 
     withings_status = withings_data.get("status", "temporarily_unavailable")
 
@@ -644,7 +794,8 @@ def summary():
         missing_sources = ["withings"]
 
     summary_data = {
-        "debug_version": "multiuser-step4b-withings-isolated",
+        "debug_version": "multiuser-step6-api-auth",
+        "user_id": user_id,
         "period_days": 14,
         "workout_count": workout_count,
         "total_distance_km": total_distance_km,
@@ -679,13 +830,14 @@ def summary():
 
 
 @app.route("/activity/<int:activity_id>/zones")
-def activity_zones(activity_id):
-    zones, error = get_activity_zones(activity_id)
+@require_api_user
+def activity_zones(user_id, activity_id):
+    zones, error = get_activity_zones(activity_id, user_id=user_id)
     if error:
         message, status = error
       
         if status == 401:
-            return redirect("/login")  # 👈 key change
+            return jsonify({"error": "Strava is not connected for this user"}), 401
 
         return jsonify({"error": message}), status
     return jsonify(zones)
