@@ -37,17 +37,44 @@ app = Flask(__name__)
 
 
 def configured_api_users():
-    """Return an API-key-to-user-ID mapping from Render variables."""
+    """Return an API-key-to-user-ID mapping from named Render variables.
+
+    Every environment variable named FITNESS_API_KEY_<USER> becomes one user.
+    For example:
+        FITNESS_API_KEY_ANDREW -> andrew
+        FITNESS_API_KEY_MAGGIE -> maggie
+        FITNESS_API_KEY_KELLY -> kelly
+    """
     users = {}
+    prefix = "FITNESS_API_KEY_"
 
-    default_key = os.getenv("FITNESS_API_KEY_ANDREW")
-    if default_key:
-        users[default_key] = DEFAULT_USER_ID
+    for variable_name, api_key in os.environ.items():
+        if not variable_name.startswith(prefix) or not api_key:
+            continue
 
-    second_user_id = os.getenv("SECOND_USER_ID")
-    second_user_key = os.getenv("FITNESS_API_KEY_SECOND_USER")
-    if second_user_id and second_user_key:
-        users[second_user_key] = second_user_id
+        user_suffix = variable_name[len(prefix):]
+
+        # Ignore the temporary generic variable used in Step 6. Named user
+        # variables are now the source of truth.
+        if user_suffix == "SECOND_USER":
+            continue
+
+        user_id = user_suffix.lower()
+
+        if not user_id.replace("_", "").isalnum():
+            app.logger.warning(
+                "Ignoring invalid API-key variable name: %s",
+                variable_name,
+            )
+            continue
+
+        existing_user = users.get(api_key)
+        if existing_user and existing_user != user_id:
+            raise RuntimeError(
+                "The same fitness API key is assigned to multiple users"
+            )
+
+        users[api_key] = user_id
 
     return users
 
@@ -794,7 +821,7 @@ def summary(user_id):
         missing_sources = ["withings"]
 
     summary_data = {
-        "debug_version": "multiuser-step6-api-auth",
+        "debug_version": "multiuser-step7-named-users",
         "user_id": user_id,
         "period_days": 14,
         "workout_count": workout_count,
