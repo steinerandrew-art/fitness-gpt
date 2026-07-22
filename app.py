@@ -5,7 +5,7 @@ import json
 import os
 import time
 
-from flask import Flask, jsonify, redirect, request
+from flask import Flask, jsonify, make_response, redirect, request
 
 from strava_client import (
     CLIENT_ID,
@@ -170,13 +170,80 @@ def read_oauth_state(state, expected_service):
     return user_id
 
 
-def connection_form(service_name, action_path):
+SETUP_COOKIE_NAME = "fitness_setup_session"
+SETUP_SESSION_SECONDS = 1800
+
+
+def create_setup_session(user_id):
+    payload = {
+        "user_id": user_id,
+        "issued_at": int(time.time()),
+    }
+    payload_bytes = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+    encoded_payload = base64.urlsafe_b64encode(payload_bytes).decode("ascii").rstrip("=")
+    signature = hmac.new(
+        oauth_state_secret(),
+        encoded_payload.encode("ascii"),
+        hashlib.sha256,
+    ).hexdigest()
+    return f"{encoded_payload}.{signature}"
+
+
+def read_setup_session():
+    session_value = request.cookies.get(SETUP_COOKIE_NAME)
+    if not session_value or "." not in session_value:
+        return None
+
+    encoded_payload, supplied_signature = session_value.rsplit(".", 1)
+    expected_signature = hmac.new(
+        oauth_state_secret(),
+        encoded_payload.encode("ascii"),
+        hashlib.sha256,
+    ).hexdigest()
+
+    if not hmac.compare_digest(supplied_signature, expected_signature):
+        return None
+
+    padded_payload = encoded_payload + "=" * (-len(encoded_payload) % 4)
+    try:
+        payload = json.loads(base64.urlsafe_b64decode(padded_payload).decode("utf-8"))
+    except (ValueError, json.JSONDecodeError):
+        return None
+
+    issued_at = payload.get("issued_at", 0)
+    if not isinstance(issued_at, int) or time.time() - issued_at > SETUP_SESSION_SECONDS:
+        return None
+
+    user_id = payload.get("user_id")
+    if user_id not in configured_api_users().values():
+        return None
+
+    return user_id
+
+
+def setup_login_form(error_message=None):
+    error_html = f"<p><strong>{error_message}</strong></p>" if error_message else ""
     return f"""
-    <h1>Connect {service_name}</h1>
-    <p>Enter the API key assigned to the user whose {service_name} account is being connected.</p>
-    <form method="post" action="{action_path}">
+    <h1>Fitness account setup</h1>
+    <p>Enter your fitness API key once. This browser will remember the selected user for 30 minutes.</p>
+    {error_html}
+    <form method="post" action="/setup">
       <label>API key: <input type="password" name="api_key" required></label>
-      <button type="submit">Continue to {service_name}</button>
+      <button type="submit">Open setup page</button>
+    </form>
+    """
+
+
+def setup_dashboard(user_id, message=None):
+    message_html = f"<p><strong>{message}</strong></p>" if message else ""
+    return f"""
+    <h1>Fitness account setup</h1>
+    <p>Setting up accounts for <strong>{user_id}</strong>.</p>
+    {message_html}
+    <p><a href="/login">Connect or reconnect Strava</a></p>
+    <p><a href="/connect/withings">Connect or reconnect Withings</a></p>
+    <form method="post" action="/setup/logout">
+      <button type="submit">Finish setup / switch user</button>
     </form>
     """
 
@@ -184,21 +251,54 @@ def connection_form(service_name, action_path):
 def home():
     return """
     <h1>Fitness GPT backend is running</h1>
-    <p><a href="/login">Connect Strava for a user</a></p>
-    <p><a href="/connect/withings">Connect Withings for a user</a></p>
+    <p><a href="/setup">Set up or reconnect user accounts</a></p>
     <p><a href="/workouts">View workouts</a></p>
     <p><a href="/summary">View summary</a></p>
     """
 
 
-@app.route("/login", methods=["GET", "POST"])
-def login():
-    if request.method == "GET":
-        return connection_form("Strava", "/login")
+@app.route("/setup", methods=["GET", "POST"])
+def setup():
+    if request.method == "POST":
+        user_id = user_id_for_api_key(request.form.get("api_key"))
+        if not user_id:
+            return setup_login_form("Invalid API key"), 401
 
-    user_id = user_id_for_api_key(request.form.get("api_key"))
+        response = make_response(redirect("/setup"))
+        response.set_cookie(
+            SETUP_COOKIE_NAME,
+            create_setup_session(user_id),
+            max_age=SETUP_SESSION_SECONDS,
+            secure=True,
+            httponly=True,
+            samesite="Lax",
+        )
+        return response
+
+    user_id = read_setup_session()
     if not user_id:
-        return "Invalid API key", 401
+        return setup_login_form()
+
+    return setup_dashboard(user_id)
+
+
+@app.route("/setup/logout", methods=["POST"])
+def setup_logout():
+    response = make_response(redirect("/setup"))
+    response.delete_cookie(
+        SETUP_COOKIE_NAME,
+        secure=True,
+        httponly=True,
+        samesite="Lax",
+    )
+    return response
+
+
+@app.route("/login")
+def login():
+    user_id = read_setup_session()
+    if not user_id:
+        return redirect("/setup")
 
     state = create_oauth_state(user_id, "strava")
     auth_url = (
@@ -234,12 +334,15 @@ def exchange_token():
         message, status = error
         return f"Token exchange failed: {message}", status
 
-    return jsonify({
-        "message": "Strava connected successfully",
-        "user_id": user_id,
-        "athlete": token_data.get("athlete", {}),
-        "expires_at": token_data.get("expires_at")
-    })
+    athlete = token_data.get("athlete", {})
+    athlete_name = " ".join(
+        part for part in [athlete.get("firstname"), athlete.get("lastname")] if part
+    ) or "the selected account"
+
+    return setup_dashboard(
+        user_id,
+        f"Strava connected successfully for {athlete_name}.",
+    )
 
 
 @app.route("/activity/<int:activity_id>")
@@ -411,14 +514,11 @@ def workouts(user_id):
     })
 
 
-@app.route("/connect/withings", methods=["GET", "POST"])
+@app.route("/connect/withings")
 def connect_withings():
-    if request.method == "GET":
-        return connection_form("Withings", "/connect/withings")
-
-    user_id = user_id_for_api_key(request.form.get("api_key"))
+    user_id = read_setup_session()
     if not user_id:
-        return "Invalid API key", 401
+        return redirect("/setup")
 
     state = create_oauth_state(user_id, "withings")
     auth_url = (
@@ -456,12 +556,10 @@ def callback_withings():
             "details": message
         }), status
 
-    return jsonify({
-        "message": "Withings connected successfully",
-        "user_id": user_id,
-        "userid": token_data.get("userid"),
-        "expires_in": token_data.get("expires_in")
-    })
+    return setup_dashboard(
+        user_id,
+        "Withings connected successfully.",
+    )
 
 
 def build_coaching_insights(summary_data, withings_data):
@@ -821,7 +919,7 @@ def summary(user_id):
         missing_sources = ["withings"]
 
     summary_data = {
-        "debug_version": "multiuser-step7-named-users",
+        "debug_version": "multiuser-step8-setup-session",
         "user_id": user_id,
         "period_days": 14,
         "workout_count": workout_count,
