@@ -111,6 +111,36 @@ def configured_api_users():
     return users
 
 
+def api_key_digest(api_key):
+    return hashlib.sha256(api_key.encode("utf-8")).hexdigest()
+
+
+def account_user_id_for_api_key(api_key):
+    if not api_key:
+        return None
+
+    response = requests.get(
+        f"{supabase_url()}/rest/v1/ai_integrations",
+        headers=supabase_headers(supabase_secret_key()),
+        params={
+            "select": "user_id",
+            "api_key_hash": f"eq.{api_key_digest(api_key)}",
+            "enabled": "eq.true",
+            "limit": "1",
+        },
+        timeout=20,
+    )
+    if response.status_code != 200:
+        app.logger.warning(
+            "Could not validate account API key: %s",
+            supabase_error_message(response, "unknown Supabase error"),
+        )
+        return None
+
+    rows = response.json()
+    return rows[0].get("user_id") if rows else None
+
+
 def user_id_for_api_key(api_key):
     if not api_key:
         return None
@@ -119,7 +149,7 @@ def user_id_for_api_key(api_key):
         if hmac.compare_digest(api_key, configured_key):
             return user_id
 
-    return None
+    return account_user_id_for_api_key(api_key)
 
 
 def api_key_from_request():
@@ -337,6 +367,48 @@ def supabase_refresh_session(refresh_token):
     )
     return response.json() if response.status_code == 200 else None
 
+
+
+def supabase_ai_integration(user_id, access_token):
+    response = requests.get(
+        f"{supabase_url()}/rest/v1/ai_integrations",
+        headers=supabase_headers(supabase_publishable_key(), access_token),
+        params={
+            "select": "user_id,key_prefix,enabled,providers,created_at,updated_at",
+            "user_id": f"eq.{user_id}",
+            "limit": "1",
+        },
+        timeout=20,
+    )
+    if response.status_code != 200:
+        app.logger.warning(
+            "Could not load AI integration: %s",
+            supabase_error_message(response, "unknown Supabase error"),
+        )
+        return None
+    rows = response.json()
+    return rows[0] if rows else None
+
+
+def upsert_ai_integration(user_id, access_token, values):
+    payload = {"user_id": user_id, **values}
+    response = requests.post(
+        f"{supabase_url()}/rest/v1/ai_integrations",
+        headers={
+            **supabase_headers(supabase_publishable_key(), access_token),
+            "Prefer": "resolution=merge-duplicates,return=representation",
+        },
+        params={"on_conflict": "user_id"},
+        json=payload,
+        timeout=20,
+    )
+    if response.status_code not in {200, 201}:
+        return None, supabase_error_message(
+            response,
+            "Could not save AI integration",
+        )
+    rows = response.json()
+    return (rows[0] if rows else payload), None
 
 def supabase_profile(user_id, access_token):
     response = requests.get(
@@ -565,7 +637,7 @@ body{{margin:0;background:#f5f7fa;color:#17202a;font-family:system-ui,-apple-sys
 main{{width:min(860px,calc(100% - 32px));margin:48px auto;background:white;border:1px solid #dfe4ea;border-radius:14px;padding:28px;box-shadow:0 8px 24px rgba(0,0,0,.06)}}
 h1{{margin-top:0}} label{{display:block;margin:16px 0 6px;font-weight:600}} input,select,textarea{{width:100%;box-sizing:border-box;padding:11px;border:1px solid #aab2bd;border-radius:8px;font:inherit}} textarea{{min-height:150px;resize:vertical}} code{{background:#eef1f4;border-radius:4px;padding:2px 5px}}
 button,.button{{display:inline-block;margin-top:20px;padding:11px 16px;border:0;border-radius:8px;background:#1f5f99;color:white;font:inherit;font-weight:650;text-decoration:none;cursor:pointer}}
-.secondary{{background:#5d6d7e}} .error{{padding:12px;border-radius:8px;background:#fdecea;color:#922b21}} .success{{padding:12px;border-radius:8px;background:#eafaf1;color:#196f3d}}
+.secondary,.button.secondary{{background:#5d6d7e;color:white}} .button.subtle{{background:#e8edf2;color:#273746}} .actions>a:not(.button){{display:inline-block;margin-top:20px;padding:11px 16px;border-radius:8px;background:#e8edf2;color:#273746;font-weight:650;text-decoration:none}} .error{{padding:12px;border-radius:8px;background:#fdecea;color:#922b21}} .success{{padding:12px;border-radius:8px;background:#eafaf1;color:#196f3d}}
 dl{{display:grid;grid-template-columns:150px 1fr;gap:10px 16px}} dt{{font-weight:700}} dd{{margin:0}}
 fieldset{{margin:20px 0;padding:16px;border:1px solid #dfe4ea;border-radius:10px}} legend{{font-weight:700;padding:0 6px}}
 .check-grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:10px 16px}} .check-grid label{{display:flex;align-items:flex-start;gap:8px;margin:0;font-weight:500}} .check-grid input{{width:auto;margin-top:3px}}
@@ -681,6 +753,7 @@ def account_onboarding_state(user_id, token):
     withings_skipped = bool(
         profile and profile.get("withings_onboarding_status") == "skipped"
     )
+    ai_status = supabase_ai_integration(user_id, token)
     state = onboarding_state(
         profile,
         training,
@@ -690,11 +763,12 @@ def account_onboarding_state(user_id, token):
             "strava": strava_status["connected"],
             "withings": withings_status["connected"],
             "withings_skipped": withings_skipped,
+            "ai": bool(ai_status and ai_status.get("enabled")),
         },
     )
     return (
         profile, training, context, goals,
-        strava_status, withings_status, withings_skipped, state,
+        strava_status, withings_status, withings_skipped, ai_status, state,
     )
 
 
@@ -1109,7 +1183,7 @@ def integration_placeholder_page(session_data, current_key, title, explanation):
 @require_account
 def onboarding_strava(session_data):
     user_id, token = session_data["user_id"], session_data["access_token"]
-    profile, training, context, goals, connection, _, _, state = account_onboarding_state(user_id, token)
+    profile, training, context, goals, connection, _, _, _, state = account_onboarding_state(user_id, token)
     if not goals_step_complete(goals):
         return redirect("/onboarding/goals")
 
@@ -1172,7 +1246,7 @@ def onboarding_withings(session_data):
     user_id, token = session_data["user_id"], session_data["access_token"]
     (
         profile, training, context, goals,
-        strava_status, connection, skipped, state,
+        strava_status, connection, skipped, _, state,
     ) = account_onboarding_state(user_id, token)
 
     if not strava_status["connected"]:
@@ -1270,19 +1344,153 @@ def account_disconnect_withings(session_data):
 @app.route("/onboarding/integrations")
 @require_account
 def onboarding_integrations(session_data):
-    return integration_placeholder_page(
-        session_data,
-        "integrations",
-        "AI integrations",
-        "AI-provider configuration has not been implemented yet.",
+    user_id, token = session_data["user_id"], session_data["access_token"]
+    (
+        profile, training, context, goals,
+        strava_status, withings_status, withings_skipped, integration, state,
+    ) = account_onboarding_state(user_id, token)
+
+    if not state["completion"].get("withings"):
+        return redirect("/onboarding/withings")
+
+    generated_key = request.args.get("generated_key")
+    generated_html = ""
+    if generated_key:
+        generated_html = f"""
+<div class="success">
+<strong>Copy this API key now.</strong> It will not be displayed again.
+<p><code style="word-break:break-all">{escape(generated_key)}</code></p>
+</div>
+"""
+
+    providers = (integration or {}).get("providers") or []
+    provider_options = [
+        ("chatgpt", "ChatGPT / custom GPT"),
+        ("claude", "Claude"),
+        ("other", "Another AI client"),
+    ]
+    provider_html = "".join(
+        f'<label><input type="checkbox" name="providers" value="{value}"'
+        f'{" checked" if value in providers else ""}> {escape(label)}</label>'
+        for value, label in provider_options
     )
+
+    if integration and integration.get("enabled"):
+        key_status = (
+            f'<p class="success"><strong>Active API key:</strong> '
+            f'{escape(integration.get("key_prefix") or "fitness_")}…</p>'
+        )
+        key_actions = """
+<form method="post" action="/account/integrations/generate-key">
+  <button type="submit">Replace API key</button>
+</form>
+<form method="post" action="/account/integrations/revoke-key">
+  <button class="secondary" type="submit">Revoke API key</button>
+</form>
+"""
+    else:
+        key_status = (
+            "<p>No active AI access key exists for this account.</p>"
+        )
+        key_actions = """
+<form method="post" action="/account/integrations/generate-key">
+  <button type="submit">Generate API key</button>
+</form>
+"""
+
+    return account_page("AI integrations", f"""
+{onboarding_progress_html(state, "integrations")}
+<h1>AI integrations</h1>
+<p>Generate an account-specific key that an AI assistant can use to request this account’s coaching data. The key grants access to the fitness API; it does not contain or replace an OpenAI or Anthropic account credential.</p>
+{generated_html}
+{key_status}
+<form method="post" action="/account/integrations/providers">
+<fieldset>
+<legend>Where will you use the coaching API?</legend>
+<div class="check-grid">{provider_html}</div>
+</fieldset>
+<div class="actions">
+  <button type="submit">Save integrations</button>
+  <a href="/account">Return to Account</a>
+</div>
+</form>
+<div class="actions">{key_actions}</div>
+<h2>Client setup</h2>
+<p>Configure the AI client to send the key in this HTTP header:</p>
+<p><code>Authorization: Bearer &lt;your API key&gt;</code></p>
+<p class="muted">Replacing or revoking the key immediately disables the previous key. Generate a separate replacement whenever a key may have been exposed.</p>
+""")
+
+
+@app.route("/account/integrations/providers", methods=["POST"])
+@require_account
+def account_integration_providers(session_data):
+    allowed = {"chatgpt", "claude", "other"}
+    providers = [
+        value for value in request.form.getlist("providers")
+        if value in allowed
+    ]
+    _, error = upsert_ai_integration(
+        session_data["user_id"],
+        session_data["access_token"],
+        {"providers": providers},
+    )
+    if error:
+        return account_page(
+            "Integration error",
+            f'<h1>Could not save integrations</h1><p class="error">{escape(error)}</p>',
+        ), 500
+    return redirect("/onboarding/integrations")
+
+
+@app.route("/account/integrations/generate-key", methods=["POST"])
+@require_account
+def account_generate_integration_key(session_data):
+    api_key = "fitness_" + secrets.token_urlsafe(32)
+    _, error = upsert_ai_integration(
+        session_data["user_id"],
+        session_data["access_token"],
+        {
+            "api_key_hash": api_key_digest(api_key),
+            "key_prefix": api_key[:16],
+            "enabled": True,
+        },
+    )
+    if error:
+        return account_page(
+            "Integration error",
+            f'<h1>Could not generate API key</h1><p class="error">{escape(error)}</p>',
+        ), 500
+    return redirect(
+        "/onboarding/integrations?generated_key=" + requests.utils.quote(api_key)
+    )
+
+
+@app.route("/account/integrations/revoke-key", methods=["POST"])
+@require_account
+def account_revoke_integration_key(session_data):
+    _, error = upsert_ai_integration(
+        session_data["user_id"],
+        session_data["access_token"],
+        {
+            "api_key_hash": None,
+            "key_prefix": None,
+            "enabled": False,
+        },
+    )
+    if error:
+        return account_page(
+            "Integration error",
+            f'<h1>Could not revoke API key</h1><p class="error">{escape(error)}</p>',
+        ), 500
+    return redirect("/onboarding/integrations")
 
 
 @app.route("/account")
 @require_account
 def account(session_data):
     user_id, token = session_data["user_id"], session_data["access_token"]
-    profile, training, context, goals, strava_status, withings_status, withings_skipped, state = account_onboarding_state(user_id, token)
+    profile, training, context, goals, strava_status, withings_status, withings_skipped, ai_status, state = account_onboarding_state(user_id, token)
     if not profile:
         return account_page("Account error", '<h1>Account unavailable</h1>'), 500
     next_step = state["next_step"]
@@ -1298,6 +1506,7 @@ def account(session_data):
         '<a href="/onboarding/goals">Edit goals</a>',
         '<a href="/onboarding/strava">Strava connection</a>',
         '<a href="/onboarding/withings">Withings connection</a>',
+        '<a href="/onboarding/integrations">AI integrations</a>',
     ])
     return account_page("Account", f"""
 <h1>{escape(profile.get("display_name") or profile["username"])}</h1>
@@ -1309,6 +1518,7 @@ def account(session_data):
 <dt>Goals</dt><dd>{len(goals)} configured</dd>
 <dt>Strava</dt><dd>{"Connected" if strava_status["connected"] else "Not connected"}</dd>
 <dt>Withings</dt><dd>{"Connected" if withings_status["connected"] else ("Skipped" if withings_skipped else "Not configured")}</dd>
+<dt>AI access</dt><dd>{"Active" if ai_status and ai_status.get("enabled") else "Not configured"}</dd>
 <dt>Onboarding</dt><dd>{"Complete" if state["complete"] else "In progress"}</dd>
 </dl>{next_html}<p>{links}</p>
 <form method="post" action="/logout"><button class="secondary" type="submit">Log out</button></form>""")
@@ -2082,7 +2292,7 @@ def summary(user_id):
         missing_sources = ["withings"]
 
     summary_data = {
-        "debug_version": "multiuser-step15a-11-training-state-machine",
+        "debug_version": "multiuser-step16-11-training-state-machine",
         "user_id": user_id,
         "period_days": 14,
         "workout_count": workout_count,
