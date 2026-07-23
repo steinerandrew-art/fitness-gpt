@@ -1379,7 +1379,7 @@ def exchange_token():
         return f"Token exchange failed: {message}", status
 
     if flow == "account":
-        current_session = read_account_session()
+        _, current_session = current_account_session()
         if not current_session or current_session.get("user_id") != user_id:
             return redirect("/login")
         return redirect("/onboarding/strava?connected=1")
