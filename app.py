@@ -1893,7 +1893,7 @@ def api_whoami(user_id):
 def api_context(user_id):
     payload = api_coaching_context(user_id)
     payload["user_id"] = user_id
-    payload["debug_version"] = "multiuser-step17b-coaching-api"
+    payload["debug_version"] = "multiuser-step17c-coaching-api"
     return jsonify(payload)
 
 
@@ -1911,7 +1911,110 @@ def openapi_schema():
         },
         "servers": [{"url": server_url}],
         "components": {
-            "schemas": {},
+            "schemas": {
+                "WhoAmIResponse": {
+                    "type": "object",
+                    "properties": {
+                        "authentication": {"type": "string"},
+                        "user_id": {"type": "string"},
+                        "username": {"type": ["string", "null"]},
+                        "display_name": {"type": ["string", "null"]},
+                        "timezone": {"type": ["string", "null"]},
+                        "units": {"type": ["string", "null"]},
+                        "onboarding_completed": {"type": "boolean"},
+                    },
+                },
+                "CoachingContextResponse": {
+                    "type": "object",
+                    "properties": {
+                        "user_id": {"type": "string"},
+                        "debug_version": {"type": "string"},
+                        "profile": {
+                            "type": "object",
+                            "additionalProperties": True,
+                            "properties": {
+                                "id": {"type": ["string", "null"]},
+                                "display_name": {"type": ["string", "null"]},
+                                "timezone": {"type": ["string", "null"]},
+                                "units": {"type": ["string", "null"]},
+                            },
+                        },
+                        "training_profile": {
+                            "type": "object",
+                            "additionalProperties": True,
+                            "properties": {
+                                "primary_focus": {"type": ["string", "null"]},
+                                "activity_preferences": {
+                                    "type": ["array", "object", "null"]
+                                },
+                                "weekday_minutes": {"type": ["integer", "null"]},
+                                "weekend_minutes": {"type": ["integer", "null"]},
+                            },
+                        },
+                        "coaching_context": {
+                            "type": "object",
+                            "additionalProperties": True,
+                            "properties": {
+                                "coaching_preferences": {
+                                    "type": ["string", "null"]
+                                },
+                                "training_philosophy": {
+                                    "type": ["string", "null"]
+                                },
+                                "lifestyle_constraints": {
+                                    "type": ["string", "null"]
+                                },
+                                "additional_context": {
+                                    "type": ["string", "null"]
+                                },
+                            },
+                        },
+                        "goals": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "additionalProperties": True,
+                                "properties": {
+                                    "id": {"type": ["integer", "string"]},
+                                    "title": {"type": ["string", "null"]},
+                                    "status": {"type": ["string", "null"]},
+                                    "priority": {"type": ["integer", "null"]},
+                                    "description": {"type": ["string", "null"]},
+                                },
+                            },
+                        },
+                    },
+                },
+                "GenericFitnessResponse": {
+                    "type": "object",
+                    "additionalProperties": True,
+                    "properties": {
+                        "debug_version": {"type": ["string", "null"]},
+                        "user_id": {"type": ["string", "null"]},
+                        "error": {"type": ["string", "null"]},
+                    },
+                },
+                "WorkoutsResponse": {
+                    "type": "object",
+                    "additionalProperties": True,
+                    "properties": {
+                        "workouts": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "additionalProperties": True,
+                                "properties": {
+                                    "id": {"type": ["integer", "string"]},
+                                    "name": {"type": ["string", "null"]},
+                                    "sport_type": {"type": ["string", "null"]},
+                                    "start_date": {"type": ["string", "null"]},
+                                },
+                            },
+                        },
+                        "error": {"type": ["string", "null"]},
+                    },
+                },
+            },
             "securitySchemes": {
                 "bearerAuth": {
                     "type": "http",
@@ -1931,7 +2034,7 @@ def openapi_schema():
                             "description": "Connected account identity",
                             "content": {
                                 "application/json": {
-                                    "schema": {"type": "object"}
+                                    "schema": {"$ref": "#/components/schemas/WhoAmIResponse"}
                                 }
                             },
                         }
@@ -1947,7 +2050,7 @@ def openapi_schema():
                             "description": "Coaching context",
                             "content": {
                                 "application/json": {
-                                    "schema": {"type": "object"}
+                                    "schema": {"$ref": "#/components/schemas/CoachingContextResponse"}
                                 }
                             },
                         }
@@ -1963,7 +2066,7 @@ def openapi_schema():
                             "description": "Fitness summary",
                             "content": {
                                 "application/json": {
-                                    "schema": {"type": "object"}
+                                    "schema": {"$ref": "#/components/schemas/GenericFitnessResponse"}
                                 }
                             },
                         }
@@ -1979,7 +2082,7 @@ def openapi_schema():
                             "description": "Recent workouts",
                             "content": {
                                 "application/json": {
-                                    "schema": {"type": "object"}
+                                    "schema": {"$ref": "#/components/schemas/WorkoutsResponse"}
                                 }
                             },
                         }
@@ -2001,7 +2104,7 @@ def openapi_schema():
                             "description": "Activity detail",
                             "content": {
                                 "application/json": {
-                                    "schema": {"type": "object"}
+                                    "schema": {"$ref": "#/components/schemas/GenericFitnessResponse"}
                                 }
                             },
                         }
@@ -2023,7 +2126,7 @@ def openapi_schema():
                             "description": "Activity zones",
                             "content": {
                                 "application/json": {
-                                    "schema": {"type": "object"}
+                                    "schema": {"$ref": "#/components/schemas/GenericFitnessResponse"}
                                 }
                             },
                         }
