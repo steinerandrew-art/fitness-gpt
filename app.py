@@ -46,6 +46,68 @@ from token_store import (
 app = Flask(__name__)
 
 
+ONBOARDING_STEPS = [
+    {"key": "profile", "label": "Profile", "path": "/onboarding/profile"},
+    {"key": "training", "label": "Training profile", "path": "/onboarding/training"},
+    {"key": "goals", "label": "Goals", "path": "/onboarding/goals"},
+    {"key": "strava", "label": "Connect Strava", "path": "/onboarding/strava"},
+    {"key": "withings", "label": "Connect Withings", "path": "/onboarding/withings"},
+    {"key": "integrations", "label": "AI integrations", "path": "/onboarding/integrations"},
+]
+
+COMMON_TIMEZONES = [
+    "America/New_York",
+    "America/Chicago",
+    "America/Denver",
+    "America/Phoenix",
+    "America/Los_Angeles",
+    "America/Anchorage",
+    "Pacific/Honolulu",
+    "America/Toronto",
+    "America/Vancouver",
+    "Europe/London",
+    "Europe/Paris",
+    "Asia/Tokyo",
+    "Australia/Sydney",
+]
+
+PRIMARY_FOCUS_OPTIONS = [
+    "Road cycling",
+    "Gravel cycling",
+    "Mountain biking",
+    "Indoor cycling",
+    "Running",
+    "Triathlon",
+    "General fitness",
+    "Multi-sport",
+]
+
+COACHING_STYLE_OPTIONS = [
+    ("adaptive", "Adaptive — adjust recommendations to readiness and circumstances"),
+    ("analytical", "Analytical — emphasize data, rationale, and trends"),
+    ("direct", "Direct — concise recommendations with minimal cushioning"),
+    ("encouraging", "Encouraging — supportive framing and reinforcement"),
+]
+
+EQUIPMENT_OPTIONS = [
+    ("smart_trainer", "Smart trainer"),
+    ("power_meter", "Bike power meter"),
+    ("heart_rate_monitor", "Heart-rate monitor"),
+    ("gps_watch", "GPS watch"),
+    ("gym_access", "Gym access"),
+    ("treadmill", "Treadmill"),
+    ("rowing_machine", "Rowing machine"),
+]
+
+PLATFORM_OPTIONS = [
+    ("zwift", "Zwift"),
+    ("trainerroad", "TrainerRoad"),
+    ("wahoo_systm", "Wahoo SYSTM"),
+    ("peloton", "Peloton"),
+    ("rouvy", "Rouvy"),
+]
+
+
 def configured_api_users():
     """Return an API-key-to-user-ID mapping from named Render variables.
 
@@ -358,6 +420,132 @@ def update_supabase_profile(user_id, access_token, updates):
     return (rows[0] if rows else updates), None
 
 
+def supabase_single_row(table, user_id, access_token, select="*"):
+    response = requests.get(
+        f"{supabase_url()}/rest/v1/{table}",
+        headers=supabase_headers(supabase_publishable_key(), access_token),
+        params={
+            "select": select,
+            "user_id": f"eq.{user_id}",
+            "limit": "1",
+        },
+        timeout=15,
+    )
+    if response.status_code != 200:
+        app.logger.warning(
+            "Supabase %s lookup failed: %s",
+            table,
+            supabase_error_message(response, "unknown error"),
+        )
+        return None
+    rows = response.json()
+    return rows[0] if rows else None
+
+
+def upsert_supabase_row(table, access_token, row, conflict_column="user_id"):
+    response = requests.post(
+        f"{supabase_url()}/rest/v1/{table}",
+        headers={
+            **supabase_headers(supabase_publishable_key(), access_token),
+            "Prefer": "resolution=merge-duplicates,return=representation",
+        },
+        params={"on_conflict": conflict_column},
+        json=row,
+        timeout=15,
+    )
+    if response.status_code not in {200, 201}:
+        message = supabase_error_message(
+            response,
+            f"The {table.replace('_', ' ')} could not be saved.",
+        )
+        app.logger.warning("Supabase %s upsert failed: %s", table, message)
+        return None, message
+    rows = response.json() if response.content else []
+    return (rows[0] if rows else row), None
+
+
+def coaching_profile(user_id, access_token):
+    return supabase_single_row(
+        "coaching_profiles",
+        user_id,
+        access_token,
+        select=(
+            "user_id,primary_focus,weekday_minutes,weekend_minutes,"
+            "coaching_style,equipment,indoor_platforms,created_at,updated_at"
+        ),
+    )
+
+
+def profile_step_complete(profile):
+    return bool(
+        profile
+        and profile.get("display_name")
+        and profile.get("timezone")
+        and profile.get("units") in {"imperial", "metric"}
+    )
+
+
+def training_step_complete(training):
+    return bool(
+        training
+        and training.get("primary_focus")
+        and isinstance(training.get("weekday_minutes"), int)
+        and isinstance(training.get("weekend_minutes"), int)
+        and training.get("coaching_style")
+    )
+
+
+def onboarding_state(profile, training):
+    completion = {
+        "profile": profile_step_complete(profile),
+        "training": training_step_complete(training),
+        # Later deployments will replace these placeholders with real checks.
+        "goals": False,
+        "strava": False,
+        "withings": False,
+        "integrations": False,
+    }
+    next_step = next(
+        (step for step in ONBOARDING_STEPS if not completion[step["key"]]),
+        None,
+    )
+    return {
+        "completion": completion,
+        "next_step": next_step,
+        "complete": next_step is None,
+    }
+
+
+def onboarding_progress_html(state, current_key=None):
+    items = []
+    for step in ONBOARDING_STEPS:
+        key = step["key"]
+        if state["completion"].get(key):
+            status = "✓"
+            css_class = "complete"
+        elif key == current_key:
+            status = "→"
+            css_class = "current"
+        else:
+            status = ""
+            css_class = "pending"
+        items.append(
+            f'<li class="{css_class}"><span>{escape(step["label"])}</span>'
+            f'<strong>{status}</strong></li>'
+        )
+    return '<ol class="wizard-progress">' + ''.join(items) + '</ol>'
+
+
+def parse_bounded_minutes(value, label):
+    try:
+        minutes = int(value)
+    except (TypeError, ValueError):
+        return None, f"{label} must be a whole number of minutes."
+    if not 0 <= minutes <= 1440:
+        return None, f"{label} must be between 0 and 1,440 minutes."
+    return minutes, None
+
+
 def create_account_session(auth_payload):
     user = auth_payload.get("user") or {}
     session_id = secrets.token_urlsafe(32)
@@ -427,6 +615,10 @@ h1{{margin-top:0}} label{{display:block;margin:16px 0 6px;font-weight:600}} inpu
 button,.button{{display:inline-block;margin-top:20px;padding:11px 16px;border:0;border-radius:8px;background:#1f5f99;color:white;font:inherit;font-weight:650;text-decoration:none;cursor:pointer}}
 .secondary{{background:#5d6d7e}} .error{{padding:12px;border-radius:8px;background:#fdecea;color:#922b21}} .success{{padding:12px;border-radius:8px;background:#eafaf1;color:#196f3d}}
 dl{{display:grid;grid-template-columns:150px 1fr;gap:10px 16px}} dt{{font-weight:700}} dd{{margin:0}}
+fieldset{{margin:20px 0;padding:16px;border:1px solid #dfe4ea;border-radius:10px}} legend{{font-weight:700;padding:0 6px}}
+.check-grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:10px 16px}} .check-grid label{{display:flex;align-items:flex-start;gap:8px;margin:0;font-weight:500}} .check-grid input{{width:auto;margin-top:3px}}
+.wizard-progress{{list-style:none;padding:0;margin:0 0 24px;display:grid;gap:8px}} .wizard-progress li{{display:flex;justify-content:space-between;padding:9px 12px;border-radius:8px;background:#f1f3f5}} .wizard-progress .complete{{background:#eafaf1}} .wizard-progress .current{{background:#eaf2f8;font-weight:700}}
+.actions{{display:flex;gap:12px;flex-wrap:wrap;align-items:center}} .muted{{color:#5d6d7e}}
 </style></head><body><main>{body}</main></body></html>"""
 
 
@@ -526,9 +718,25 @@ def account_logout():
     return response
 
 
-@app.route("/onboarding", methods=["GET", "POST"])
+@app.route("/onboarding")
 @require_account
 def onboarding(session_data):
+    profile = supabase_profile(
+        session_data["user_id"],
+        session_data["access_token"],
+    )
+    training = coaching_profile(
+        session_data["user_id"],
+        session_data["access_token"],
+    )
+    state = onboarding_state(profile, training)
+    destination = state["next_step"]["path"] if state["next_step"] else "/account"
+    return redirect(destination)
+
+
+@app.route("/onboarding/profile", methods=["GET", "POST"])
+@require_account
+def onboarding_profile(session_data):
     profile = supabase_profile(
         session_data["user_id"],
         session_data["access_token"],
@@ -540,6 +748,11 @@ def onboarding(session_data):
             '<p class="error">The profile record could not be loaded.</p>',
         ), 500
 
+    training = coaching_profile(
+        session_data["user_id"],
+        session_data["access_token"],
+    )
+    state = onboarding_state(profile, training)
     error_message = None
 
     if request.method == "POST":
@@ -551,10 +764,8 @@ def onboarding(session_data):
             error_message = "Display name is required."
         elif len(display_name) > 100:
             error_message = "Display name must be 100 characters or fewer."
-        elif not timezone_name:
-            error_message = "Time zone is required."
-        elif len(timezone_name) > 100:
-            error_message = "Time zone must be 100 characters or fewer."
+        elif timezone_name not in COMMON_TIMEZONES:
+            error_message = "Choose a supported time zone."
         elif units not in {"imperial", "metric"}:
             error_message = "Choose imperial or metric units."
         else:
@@ -565,11 +776,11 @@ def onboarding(session_data):
                     "display_name": display_name,
                     "timezone": timezone_name,
                     "units": units,
-                    "onboarding_completed": True,
+                    "onboarding_completed": False,
                 },
             )
             if not error_message:
-                return redirect("/account?onboarding=saved")
+                return redirect("/onboarding/training")
 
     error_html = (
         f'<p class="error">{escape(error_message)}</p>'
@@ -588,29 +799,192 @@ def onboarding(session_data):
         profile.get("units") or "imperial",
     )
 
+    timezone_options = ''.join(
+        f'<option value="{escape(zone)}" '
+        f'{"selected" if zone == timezone_name else ""}>{escape(zone)}</option>'
+        for zone in COMMON_TIMEZONES
+    )
     imperial_selected = "selected" if units == "imperial" else ""
     metric_selected = "selected" if units == "metric" else ""
 
     return account_page(
         "Profile setup",
         f"""
-<h1>Profile setup</h1>
-<p>This establishes account-level settings shared by every coaching integration. Goals and coaching preferences come next.</p>
+{onboarding_progress_html(state, "profile")}
+<h1>Profile</h1>
+<p>Set the personal details shared by every coaching integration.</p>
 {error_html}
-<form method="post" action="/onboarding">
+<form method="post" action="/onboarding/profile">
 <label for="display_name">Display name</label>
 <input id="display_name" name="display_name" maxlength="100" value="{escape(display_name)}" required>
 <label for="timezone">Time zone</label>
-<input id="timezone" name="timezone" maxlength="100" value="{escape(timezone_name)}" required>
-<p>Use an IANA time-zone name such as <code>America/Denver</code>.</p>
+<select id="timezone" name="timezone" required>{timezone_options}</select>
+<p class="muted">The browser will select its detected time zone when it appears in this list.</p>
 <label for="units">Measurement units</label>
 <select id="units" name="units" required>
 <option value="imperial" {imperial_selected}>Imperial</option>
 <option value="metric" {metric_selected}>Metric</option>
 </select>
-<button type="submit">Save profile</button>
+<div class="actions"><button type="submit">Save and continue</button><a href="/account">Return to account</a></div>
 </form>
-<p><a href="/account">Return to account</a></p>""",
+<script>
+const detectedZone = Intl.DateTimeFormat().resolvedOptions().timeZone;
+const timeZoneSelect = document.getElementById('timezone');
+if (detectedZone && [...timeZoneSelect.options].some(option => option.value === detectedZone)) {{
+  if (!timeZoneSelect.value) timeZoneSelect.value = detectedZone;
+}}
+</script>""",
+    )
+
+
+@app.route("/onboarding/training", methods=["GET", "POST"])
+@require_account
+def onboarding_training(session_data):
+    profile = supabase_profile(
+        session_data["user_id"],
+        session_data["access_token"],
+    )
+    if not profile_step_complete(profile):
+        return redirect("/onboarding/profile")
+
+    training = coaching_profile(
+        session_data["user_id"],
+        session_data["access_token"],
+    ) or {}
+    state = onboarding_state(profile, training)
+    error_message = None
+
+    if request.method == "POST":
+        primary_focus = request.form.get("primary_focus", "").strip()
+        coaching_style = request.form.get("coaching_style", "").strip()
+        weekday_minutes, weekday_error = parse_bounded_minutes(
+            request.form.get("weekday_minutes"),
+            "Weekday duration",
+        )
+        weekend_minutes, weekend_error = parse_bounded_minutes(
+            request.form.get("weekend_minutes"),
+            "Weekend duration",
+        )
+        equipment = {
+            key: key in request.form
+            for key, _ in EQUIPMENT_OPTIONS
+        }
+        indoor_platforms = [
+            key for key, _ in PLATFORM_OPTIONS if key in request.form
+        ]
+
+        if primary_focus not in PRIMARY_FOCUS_OPTIONS:
+            error_message = "Choose a primary training focus."
+        elif weekday_error:
+            error_message = weekday_error
+        elif weekend_error:
+            error_message = weekend_error
+        elif coaching_style not in {key for key, _ in COACHING_STYLE_OPTIONS}:
+            error_message = "Choose a coaching style."
+        else:
+            _, error_message = upsert_supabase_row(
+                "coaching_profiles",
+                session_data["access_token"],
+                {
+                    "user_id": session_data["user_id"],
+                    "primary_focus": primary_focus,
+                    "weekday_minutes": weekday_minutes,
+                    "weekend_minutes": weekend_minutes,
+                    "coaching_style": coaching_style,
+                    "equipment": equipment,
+                    "indoor_platforms": indoor_platforms,
+                },
+            )
+            if not error_message:
+                return redirect("/onboarding/goals")
+
+    primary_focus = request.form.get(
+        "primary_focus",
+        training.get("primary_focus") or "",
+    )
+    weekday_minutes = request.form.get(
+        "weekday_minutes",
+        str(training.get("weekday_minutes") if training.get("weekday_minutes") is not None else 60),
+    )
+    weekend_minutes = request.form.get(
+        "weekend_minutes",
+        str(training.get("weekend_minutes") if training.get("weekend_minutes") is not None else 120),
+    )
+    coaching_style = request.form.get(
+        "coaching_style",
+        training.get("coaching_style") or "adaptive",
+    )
+    saved_equipment = training.get("equipment") or {}
+    saved_platforms = training.get("indoor_platforms") or []
+
+    focus_options = '<option value="">Choose one</option>' + ''.join(
+        f'<option value="{escape(option)}" '
+        f'{"selected" if option == primary_focus else ""}>{escape(option)}</option>'
+        for option in PRIMARY_FOCUS_OPTIONS
+    )
+    style_options = ''.join(
+        f'<option value="{escape(key)}" '
+        f'{"selected" if key == coaching_style else ""}>{escape(label)}</option>'
+        for key, label in COACHING_STYLE_OPTIONS
+    )
+    equipment_html = ''.join(
+        f'<label><input type="checkbox" name="{escape(key)}" '
+        f'{"checked" if (key in request.form if request.method == "POST" else saved_equipment.get(key)) else ""}>'
+        f'<span>{escape(label)}</span></label>'
+        for key, label in EQUIPMENT_OPTIONS
+    )
+    platforms_html = ''.join(
+        f'<label><input type="checkbox" name="{escape(key)}" '
+        f'{"checked" if (key in request.form if request.method == "POST" else key in saved_platforms) else ""}>'
+        f'<span>{escape(label)}</span></label>'
+        for key, label in PLATFORM_OPTIONS
+    )
+    error_html = (
+        f'<p class="error">{escape(error_message)}</p>'
+        if error_message else ""
+    )
+
+    return account_page(
+        "Training profile",
+        f"""
+{onboarding_progress_html(state, "training")}
+<h1>Training profile</h1>
+<p>Describe how you normally train. These are durable defaults, not this week's schedule.</p>
+{error_html}
+<form method="post" action="/onboarding/training">
+<label for="primary_focus">Primary focus</label>
+<select id="primary_focus" name="primary_focus" required>{focus_options}</select>
+<label for="weekday_minutes">Typical weekday workout duration</label>
+<input id="weekday_minutes" type="number" name="weekday_minutes" min="0" max="1440" step="5" value="{escape(str(weekday_minutes))}" required>
+<label for="weekend_minutes">Typical weekend workout duration</label>
+<input id="weekend_minutes" type="number" name="weekend_minutes" min="0" max="1440" step="5" value="{escape(str(weekend_minutes))}" required>
+<label for="coaching_style">Default coaching style</label>
+<select id="coaching_style" name="coaching_style" required>{style_options}</select>
+<fieldset><legend>Equipment and access</legend><div class="check-grid">{equipment_html}</div></fieldset>
+<fieldset><legend>Indoor platforms</legend><div class="check-grid">{platforms_html}</div></fieldset>
+<div class="actions"><button type="submit">Save and continue</button><a href="/onboarding/profile">Back</a></div>
+</form>""",
+    )
+
+
+@app.route("/onboarding/goals")
+@require_account
+def onboarding_goals(session_data):
+    profile = supabase_profile(session_data["user_id"], session_data["access_token"])
+    training = coaching_profile(session_data["user_id"], session_data["access_token"])
+    if not profile_step_complete(profile):
+        return redirect("/onboarding/profile")
+    if not training_step_complete(training):
+        return redirect("/onboarding/training")
+    state = onboarding_state(profile, training)
+    return account_page(
+        "Goals coming next",
+        f"""
+{onboarding_progress_html(state, "goals")}
+<h1>Goals</h1>
+<p class="success">Your profile and training defaults are saved.</p>
+<p>The goals data model and editing interface are the next onboarding stage. Goals remain incomplete until that stage is deployed.</p>
+<div class="actions"><a class="button" href="/account">Return to account</a><a href="/onboarding/training">Edit training profile</a></div>""",
     )
 
 
@@ -619,29 +993,48 @@ def onboarding(session_data):
 def account(session_data):
     profile = supabase_profile(session_data["user_id"], session_data["access_token"])
     if not profile:
-        return account_page("Account error", """
-<h1>Account unavailable</h1><p class="error">You are logged in, but the matching profile record could not be loaded.</p>"""), 500
+        return account_page(
+            "Account error",
+            '<h1>Account unavailable</h1>'
+            '<p class="error">You are logged in, but the matching profile record could not be loaded.</p>',
+        ), 500
 
-    saved_notice = (
-        '<p class="success">Profile settings saved.</p>'
-        if request.args.get("onboarding") == "saved" else ""
+    training = coaching_profile(
+        session_data["user_id"],
+        session_data["access_token"],
     )
-    onboarding_label = "Complete" if profile.get("onboarding_completed") else "Ready to begin"
-    onboarding_button = "Edit profile settings" if profile.get("onboarding_completed") else "Begin profile setup"
+    state = onboarding_state(profile, training)
+    next_step = state["next_step"]
+    next_html = (
+        f'<p><strong>Next step:</strong> {escape(next_step["label"])}</p>'
+        f'<p><a class="button" href="{escape(next_step["path"])}">Continue onboarding</a></p>'
+        if next_step
+        else '<p class="success">Onboarding complete.</p>'
+    )
+    training_summary = "Not configured"
+    if training_step_complete(training):
+        training_summary = (
+            f'{escape(training.get("primary_focus") or "")} · '
+            f'{escape(str(training.get("weekday_minutes")))} min weekdays · '
+            f'{escape(str(training.get("weekend_minutes")))} min weekends'
+        )
 
-    return account_page("Account", f"""
+    return account_page(
+        "Account",
+        f"""
 <h1>{escape(profile.get("display_name") or profile["username"])}</h1>
 <p class="success">Browser account authentication is working.</p>
-{saved_notice}
 <dl><dt>Display name</dt><dd>{escape(profile.get("display_name") or "")}</dd>
 <dt>Username</dt><dd>{escape(profile.get("username") or "")}</dd>
 <dt>Email</dt><dd>{escape(profile.get("email") or session_data.get("email") or "")}</dd>
 <dt>Time zone</dt><dd>{escape(profile.get("timezone") or "")}</dd>
 <dt>Units</dt><dd>{escape(profile.get("units") or "")}</dd>
-<dt>Onboarding</dt><dd>{onboarding_label}</dd></dl>
-<p><a class="button" href="/onboarding">{onboarding_button}</a></p>
-<p>Goals, coaching preferences, and fitness-service connections will be added in the next onboarding stages.</p>
-<form method="post" action="/logout"><button class="secondary" type="submit">Log out</button></form>""")
+<dt>Training profile</dt><dd>{training_summary}</dd>
+<dt>Onboarding</dt><dd>{"Complete" if state["complete"] else "In progress"}</dd></dl>
+{next_html}
+<p><a href="/onboarding/profile">Edit profile</a>{' · <a href="/onboarding/training">Edit training profile</a>' if training else ''}</p>
+<form method="post" action="/logout"><button class="secondary" type="submit">Log out</button></form>""",
+    )
 
 
 SETUP_COOKIE_NAME = "fitness_setup_session"
@@ -1394,7 +1787,7 @@ def summary(user_id):
         missing_sources = ["withings"]
 
     summary_data = {
-        "debug_version": "multiuser-step10-profile-onboarding",
+        "debug_version": "multiuser-step11-training-state-machine",
         "user_id": user_id,
         "period_days": 14,
         "workout_count": workout_count,
