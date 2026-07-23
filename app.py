@@ -456,6 +456,29 @@ def service_coaching_goals(user_id):
     return response.json()
 
 
+
+def finalize_onboarding_if_complete(user_id, access_token, state):
+    if not state.get("complete"):
+        return False
+
+    profile = supabase_profile(user_id, access_token) or {}
+    if profile.get("onboarding_completed"):
+        return True
+
+    _, error = update_supabase_profile(
+        user_id,
+        access_token,
+        {"onboarding_completed": True},
+    )
+    if error:
+        app.logger.warning(
+            "Could not finalize onboarding for %s: %s",
+            user_id,
+            error,
+        )
+        return False
+    return True
+
 def api_coaching_context(user_id):
     profile = service_single_row(
         "profiles",
@@ -726,7 +749,7 @@ dl{{display:grid;grid-template-columns:150px 1fr;gap:10px 16px}} dt{{font-weight
 fieldset{{margin:20px 0;padding:16px;border:1px solid #dfe4ea;border-radius:10px}} legend{{font-weight:700;padding:0 6px}}
 .check-grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:10px 16px}} .check-grid label{{display:flex;align-items:flex-start;gap:8px;margin:0;font-weight:500}} .check-grid input{{width:auto;margin-top:3px}}
 .wizard-progress{{list-style:none;padding:0;margin:0 0 24px;display:grid;gap:8px}} .wizard-progress li{{display:flex;justify-content:space-between;padding:9px 12px;border-radius:8px;background:#f1f3f5}} .wizard-progress .complete{{background:#eafaf1}} .wizard-progress .current{{background:#eaf2f8;font-weight:700}}
-.actions{{display:flex;gap:12px;flex-wrap:wrap;align-items:center}} .muted{{color:#5d6d7e}}
+.actions{{display:flex;gap:12px;flex-wrap:wrap;align-items:center}} .account-actions{{margin:18px 0}} .account-actions .button{{margin-top:0}} .muted{{color:#5d6d7e}}
 .table-scroll{{overflow-x:auto}} .preference-table{{width:100%;border-collapse:collapse}} .preference-table th,.preference-table td{{padding:8px;text-align:left;vertical-align:middle;border-bottom:1px solid #e5e8eb}} .preference-table thead th{{font-size:.9rem;color:#5d6d7e}} .preference-table tbody th{{width:64px;text-align:center}} .preference-table select{{min-width:190px}}
 </style></head><body><main>{body}</main></body></html>"""
 
@@ -1437,6 +1460,10 @@ def onboarding_integrations(session_data):
     if not state["completion"].get("withings"):
         return redirect("/onboarding/withings")
 
+    finalized = finalize_onboarding_if_complete(user_id, token, state)
+    if finalized:
+        profile = {**(profile or {}), "onboarding_completed": True}
+
     generated_key = request.args.get("generated_key")
     generated_html = ""
     if generated_key:
@@ -1499,13 +1526,30 @@ def onboarding_integrations(session_data):
 </div>
 </form>
 <div class="actions">{key_actions}</div>
-<h2>Client setup</h2>
-<p>Configure the AI client to send the key in this HTTP header:</p>
-<p><code>Authorization: Bearer &lt;your API key&gt;</code></p>
-<p>For clients that can import an OpenAPI schema, use:</p>
-<p><code>{escape(request.url_root.rstrip("/") + "/openapi.json")}</code></p>
-<p>After configuration, call <code>/whoami</code> first. Then retrieve both <code>/coaching-context</code> and <code>/summary</code> before giving individualized coaching advice.</p>
-<p class="muted">Replacing or revoking the key immediately disables the previous key. Generate a separate replacement whenever a key may have been exposed.</p>
+<h2>ChatGPT custom GPT setup</h2>
+<ol>
+  <li>In ChatGPT, create or edit a custom GPT.</li>
+  <li>Open its Actions configuration and import this OpenAPI schema:</li>
+</ol>
+<p><code style="word-break:break-all">{escape(request.url_root.rstrip("/") + "/openapi.json")}</code></p>
+<ol start="3">
+  <li>Choose API-key authentication using a bearer token.</li>
+  <li>Paste the full fitness API key generated above.</li>
+  <li>Add the coaching instructions below to the GPT instructions.</li>
+  <li>Test <code>getCurrentFitnessAccount</code>, then <code>getCoachingContext</code> and <code>getFitnessSummary</code>.</li>
+</ol>
+<h3>Coaching instructions</h3>
+<pre style="white-space:pre-wrap">Before giving individualized training advice:
+
+1. Call getCurrentFitnessAccount to verify which account is connected.
+2. Call getCoachingContext to load the user's profile, goals, preferences, constraints, equipment, and persistent coaching instructions.
+3. Call getFitnessSummary to load recent training, intensity, readiness, and available body-composition data.
+4. Call getRecentWorkouts or a specific activity endpoint when more detail is needed.
+5. Treat the coaching context as persistent user instructions. Do not invent missing measurements or claim unavailable data is current.
+6. When Withings is unavailable or intentionally skipped, use Strava and stored coaching context and clearly identify the limitation.
+7. Give practical recommendations that account for available time, preferred activities, equipment, weather strategy, and stated goals.</pre>
+<p class="muted">Creating or editing a custom GPT requires a ChatGPT plan that supports GPT creation. The fitness API key authenticates only to this coaching backend; it is not an OpenAI credential.</p>
+<p class="muted">Replacing or revoking the key immediately disables the previous key.</p>
 """)
 
 
@@ -1548,6 +1592,20 @@ def account_generate_integration_key(session_data):
             "Integration error",
             f'<h1>Could not generate API key</h1><p class="error">{escape(error)}</p>',
         ), 500
+
+    (
+        _profile, _training, _context, _goals,
+        _strava, _withings, _skipped, _integration, state,
+    ) = account_onboarding_state(
+        session_data["user_id"],
+        session_data["access_token"],
+    )
+    finalize_onboarding_if_complete(
+        session_data["user_id"],
+        session_data["access_token"],
+        state,
+    )
+
     return redirect(
         "/onboarding/integrations?generated_key=" + requests.utils.quote(api_key)
     )
@@ -1586,14 +1644,14 @@ def account(session_data):
         f'<p><a class="button" href="{escape(next_step["path"])}">Continue onboarding</a></p>'
         if next_step else '<p class="success">Onboarding complete.</p>'
     )
-    links = " · ".join([
-        '<a href="/onboarding/profile">Edit personal profile</a>',
-        '<a href="/onboarding/training">Edit training profile</a>',
-        '<a href="/onboarding/context">Edit coaching context</a>',
-        '<a href="/onboarding/goals">Edit goals</a>',
-        '<a href="/onboarding/strava">Strava connection</a>',
-        '<a href="/onboarding/withings">Withings connection</a>',
-        '<a href="/onboarding/integrations">AI integrations</a>',
+    links = "".join([
+        '<a class="button subtle" href="/onboarding/profile">Edit personal profile</a>',
+        '<a class="button subtle" href="/onboarding/training">Edit training profile</a>',
+        '<a class="button subtle" href="/onboarding/context">Edit coaching context</a>',
+        '<a class="button subtle" href="/onboarding/goals">Edit goals</a>',
+        '<a class="button subtle" href="/onboarding/strava">Strava connection</a>',
+        '<a class="button subtle" href="/onboarding/withings">Withings connection</a>',
+        '<a class="button subtle" href="/onboarding/integrations">AI integrations</a>',
     ])
     return account_page("Account", f"""
 <h1>{escape(profile.get("display_name") or profile["username"])}</h1>
@@ -1607,7 +1665,22 @@ def account(session_data):
 <dt>Withings</dt><dd>{"Connected" if withings_status["connected"] else ("Skipped" if withings_skipped else "Not configured")}</dd>
 <dt>AI access</dt><dd>{"Active" if ai_status and ai_status.get("enabled") else "Not configured"}</dd>
 <dt>Onboarding</dt><dd>{"Complete" if state["complete"] else "In progress"}</dd>
-</dl>{next_html}<p>{links}</p>
+</dl>{next_html}
+<div class="actions account-actions">{links}</div>
+{"<div class='success'><strong>Onboarding complete.</strong> Your account is ready for an AI coaching client.</div>" if state.get("complete") else ""}
+<h2>Set up your AI coach</h2>
+<p>Use the AI Integrations page to generate or replace an API key and copy the exact OpenAPI schema URL for this deployment.</p>
+<ol>
+  <li>Create or edit your custom GPT.</li>
+  <li>Import the OpenAPI schema shown on the AI Integrations page.</li>
+  <li>Configure bearer authentication with the generated fitness API key.</li>
+  <li>Add the supplied coaching instructions to the GPT instructions.</li>
+  <li>Test <code>/whoami</code>, then <code>/coaching-context</code> and <code>/summary</code>.</li>
+</ol>
+<p class="muted">Creating or editing a custom GPT requires a ChatGPT plan that supports GPT creation. Your fitness account does not store OpenAI credentials.</p>
+<div class="actions">
+  <a class="button" href="/onboarding/integrations">Open AI Integrations</a>
+</div>
 <form method="post" action="/logout"><button class="secondary" type="submit">Log out</button></form>""")
 
 
@@ -1820,7 +1893,7 @@ def api_whoami(user_id):
 def api_context(user_id):
     payload = api_coaching_context(user_id)
     payload["user_id"] = user_id
-    payload["debug_version"] = "multiuser-step17-coaching-api"
+    payload["debug_version"] = "multiuser-step17a-coaching-api"
     return jsonify(payload)
 
 
