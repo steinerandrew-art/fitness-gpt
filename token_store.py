@@ -70,3 +70,27 @@ def get_service_tokens(service, user_id=DEFAULT_USER_ID):
 def save_service_tokens(service, tokens, user_id=DEFAULT_USER_ID):
     for key, value in tokens.items():
         set_token(service, key, value, user_id)
+
+# ---------------------------------------------------------------------------
+# Browser account sessions
+# ---------------------------------------------------------------------------
+
+BROWSER_SESSION_PREFIX = "fitness:browser_session:"
+
+
+def save_browser_session(session_id, session_data, ttl_seconds):
+    """Store a server-side browser session with automatic expiration."""
+    redis.set(f"{BROWSER_SESSION_PREFIX}{session_id}", session_data, ex=ttl_seconds)
+
+
+def get_browser_session(session_id):
+    """Return a stored browser session, or None if it is missing/expired."""
+    if not session_id:
+        return None
+    return redis.get(f"{BROWSER_SESSION_PREFIX}{session_id}")
+
+
+def delete_browser_session(session_id):
+    """Delete a browser session immediately."""
+    if session_id:
+        redis.delete(f"{BROWSER_SESSION_PREFIX}{session_id}")

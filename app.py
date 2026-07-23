@@ -3,7 +3,12 @@ import hashlib
 import hmac
 import json
 import os
+import re
+import secrets
 import time
+from html import escape
+
+import requests
 
 from flask import Flask, jsonify, make_response, redirect, request
 
@@ -31,7 +36,12 @@ from withings_client import (
 from datetime import datetime, timezone
 from functools import wraps
 
-from token_store import DEFAULT_USER_ID
+from token_store import (
+    DEFAULT_USER_ID,
+    delete_browser_session,
+    get_browser_session,
+    save_browser_session,
+)
 
 app = Flask(__name__)
 
@@ -170,6 +180,341 @@ def read_oauth_state(state, expected_service):
     return user_id
 
 
+# ===========================================================================
+# Supabase-backed browser accounts
+# ===========================================================================
+
+ACCOUNT_COOKIE_NAME = "fitness_account_session"
+ACCOUNT_SESSION_SECONDS = 60 * 60 * 24 * 14
+
+
+def required_environment(name):
+    value = os.getenv(name)
+    if not value:
+        raise RuntimeError(f"{name} is not configured")
+    return value.rstrip("/")
+
+
+def supabase_url():
+    return required_environment("SUPABASE_URL")
+
+
+def supabase_publishable_key():
+    return required_environment("SUPABASE_PUBLISHABLE_KEY")
+
+
+def supabase_secret_key():
+    return required_environment("SUPABASE_SECRET_KEY")
+
+
+def flask_session_secret():
+    return required_environment("FLASK_SESSION_SECRET").encode("utf-8")
+
+
+def account_cookie_value(session_id):
+    signature = hmac.new(
+        flask_session_secret(),
+        session_id.encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+    return f"{session_id}.{signature}"
+
+
+def session_id_from_cookie():
+    cookie_value = request.cookies.get(ACCOUNT_COOKIE_NAME)
+    if not cookie_value or "." not in cookie_value:
+        return None
+
+    session_id, supplied_signature = cookie_value.rsplit(".", 1)
+    expected_signature = hmac.new(
+        flask_session_secret(),
+        session_id.encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+
+    if not hmac.compare_digest(supplied_signature, expected_signature):
+        return None
+
+    return session_id
+
+
+def supabase_headers(key, access_token=None):
+    headers = {"apikey": key, "Content-Type": "application/json"}
+    if access_token:
+        headers["Authorization"] = f"Bearer {access_token}"
+    return headers
+
+
+def supabase_error_message(response, fallback):
+    try:
+        payload = response.json()
+    except ValueError:
+        return fallback
+    return (
+        payload.get("msg")
+        or payload.get("message")
+        or payload.get("error_description")
+        or payload.get("error")
+        or fallback
+    )
+
+
+def lookup_email_for_identifier(identifier):
+    identifier = (identifier or "").strip()
+    if "@" in identifier:
+        return identifier.lower()
+
+    response = requests.get(
+        f"{supabase_url()}/rest/v1/profiles",
+        headers=supabase_headers(supabase_secret_key(), supabase_secret_key()),
+        params={"select": "email", "username": f"ilike.{identifier}", "limit": "1"},
+        timeout=15,
+    )
+    if response.status_code != 200:
+        app.logger.warning("Supabase username lookup failed: %s", supabase_error_message(response, "unknown error"))
+        return None
+    rows = response.json()
+    return rows[0].get("email") if rows else None
+
+
+def supabase_password_login(email, password):
+    response = requests.post(
+        f"{supabase_url()}/auth/v1/token",
+        params={"grant_type": "password"},
+        headers=supabase_headers(supabase_publishable_key()),
+        json={"email": email, "password": password},
+        timeout=15,
+    )
+    if response.status_code != 200:
+        return None, supabase_error_message(response, "The email/username or password was not accepted.")
+    return response.json(), None
+
+
+def supabase_signup(email, password, username, display_name):
+    response = requests.post(
+        f"{supabase_url()}/auth/v1/signup",
+        headers=supabase_headers(supabase_publishable_key()),
+        json={
+            "email": email,
+            "password": password,
+            "data": {"username": username, "display_name": display_name or username},
+        },
+        timeout=15,
+    )
+    if response.status_code not in {200, 201}:
+        return None, supabase_error_message(response, "The account could not be created.")
+    return response.json(), None
+
+
+def supabase_refresh_session(refresh_token):
+    response = requests.post(
+        f"{supabase_url()}/auth/v1/token",
+        params={"grant_type": "refresh_token"},
+        headers=supabase_headers(supabase_publishable_key()),
+        json={"refresh_token": refresh_token},
+        timeout=15,
+    )
+    return response.json() if response.status_code == 200 else None
+
+
+def supabase_profile(user_id, access_token):
+    response = requests.get(
+        f"{supabase_url()}/rest/v1/profiles",
+        headers=supabase_headers(supabase_publishable_key(), access_token),
+        params={
+            "select": "id,username,email,display_name,timezone,units,onboarding_completed,created_at",
+            "id": f"eq.{user_id}",
+            "limit": "1",
+        },
+        timeout=15,
+    )
+    if response.status_code != 200:
+        app.logger.warning("Supabase profile lookup failed: %s", supabase_error_message(response, "unknown error"))
+        return None
+    rows = response.json()
+    return rows[0] if rows else None
+
+
+def create_account_session(auth_payload):
+    user = auth_payload.get("user") or {}
+    session_id = secrets.token_urlsafe(32)
+    expires_at = auth_payload.get("expires_at") or int(time.time()) + int(auth_payload.get("expires_in", 3600))
+    session_data = {
+        "user_id": user.get("id"),
+        "email": user.get("email"),
+        "access_token": auth_payload.get("access_token"),
+        "refresh_token": auth_payload.get("refresh_token"),
+        "expires_at": int(expires_at),
+    }
+    if not all([session_data["user_id"], session_data["access_token"], session_data["refresh_token"]]):
+        raise RuntimeError("Supabase returned an incomplete login session")
+    save_browser_session(session_id, session_data, ACCOUNT_SESSION_SECONDS)
+    return session_id
+
+
+def current_account_session():
+    session_id = session_id_from_cookie()
+    session_data = get_browser_session(session_id)
+    if not session_id or not session_data:
+        return None, None
+
+    if isinstance(session_data, str):
+        try:
+            session_data = json.loads(session_data)
+        except json.JSONDecodeError:
+            delete_browser_session(session_id)
+            return None, None
+
+    if session_data.get("expires_at", 0) <= int(time.time()) + 60:
+        refreshed = supabase_refresh_session(session_data.get("refresh_token"))
+        if not refreshed:
+            delete_browser_session(session_id)
+            return None, None
+        user = refreshed.get("user") or {}
+        session_data.update({
+            "user_id": user.get("id") or session_data.get("user_id"),
+            "email": user.get("email") or session_data.get("email"),
+            "access_token": refreshed.get("access_token"),
+            "refresh_token": refreshed.get("refresh_token"),
+            "expires_at": int(refreshed.get("expires_at") or (time.time() + int(refreshed.get("expires_in", 3600)))),
+        })
+        save_browser_session(session_id, session_data, ACCOUNT_SESSION_SECONDS)
+    return session_id, session_data
+
+
+def account_page(title, body):
+    return f"""<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{escape(title)} · Fitness Coaching</title>
+<style>
+body{{margin:0;background:#f5f7fa;color:#17202a;font-family:system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}}
+main{{width:min(640px,calc(100% - 32px));margin:48px auto;background:white;border:1px solid #dfe4ea;border-radius:14px;padding:28px;box-shadow:0 8px 24px rgba(0,0,0,.06)}}
+h1{{margin-top:0}} label{{display:block;margin:16px 0 6px;font-weight:600}} input{{width:100%;box-sizing:border-box;padding:11px;border:1px solid #aab2bd;border-radius:8px;font:inherit}}
+button,.button{{display:inline-block;margin-top:20px;padding:11px 16px;border:0;border-radius:8px;background:#1f5f99;color:white;font:inherit;font-weight:650;text-decoration:none;cursor:pointer}}
+.secondary{{background:#5d6d7e}} .error{{padding:12px;border-radius:8px;background:#fdecea;color:#922b21}} .success{{padding:12px;border-radius:8px;background:#eafaf1;color:#196f3d}}
+dl{{display:grid;grid-template-columns:150px 1fr;gap:10px 16px}} dt{{font-weight:700}} dd{{margin:0}}
+</style></head><body><main>{body}</main></body></html>"""
+
+
+def login_form(error_message=None):
+    error_html = f'<p class="error">{escape(error_message)}</p>' if error_message else ""
+    return account_page("Log in", f"""
+<h1>Log in</h1>{error_html}
+<form method="post" action="/login">
+<label for="identifier">Email or username</label><input id="identifier" name="identifier" autocomplete="username" required>
+<label for="password">Password</label><input id="password" type="password" name="password" autocomplete="current-password" required>
+<button type="submit">Log in</button></form>
+<p>Need an account? <a href="/register">Create one</a>.</p>""")
+
+
+def registration_form(error_message=None):
+    error_html = f'<p class="error">{escape(error_message)}</p>' if error_message else ""
+    return account_page("Create account", f"""
+<h1>Create an account</h1>{error_html}
+<form method="post" action="/register">
+<label for="email">Email</label><input id="email" type="email" name="email" autocomplete="email" required>
+<label for="username">Username</label><input id="username" name="username" pattern="[A-Za-z0-9_-]{{3,30}}" autocomplete="username" required>
+<label for="display_name">Display name</label><input id="display_name" name="display_name" autocomplete="name">
+<label for="password">Password</label><input id="password" type="password" name="password" minlength="8" autocomplete="new-password" required>
+<button type="submit">Create account</button></form>
+<p>Already registered? <a href="/login">Log in</a>.</p>""")
+
+
+@app.route("/register", methods=["GET", "POST"])
+def register():
+    if current_account_session()[1]:
+        return redirect("/account")
+    if request.method == "GET":
+        return registration_form()
+
+    email = request.form.get("email", "").strip().lower()
+    username = request.form.get("username", "").strip()
+    display_name = request.form.get("display_name", "").strip()
+    password = request.form.get("password", "")
+
+    if not re.fullmatch(r"[A-Za-z0-9_-]{3,30}", username):
+        return registration_form("Username must be 3–30 characters using letters, numbers, underscores, or hyphens."), 400
+    if len(password) < 8:
+        return registration_form("Password must contain at least eight characters."), 400
+
+    auth_payload, error = supabase_signup(email, password, username, display_name)
+    if error:
+        return registration_form(error), 400
+    if not auth_payload.get("access_token"):
+        return account_page("Check your email", """
+<h1>Check your email</h1><p class="success">Your account was created. Follow the confirmation link from Supabase, then return here to log in.</p>
+<p><a class="button" href="/login">Go to login</a></p>""")
+
+    session_id = create_account_session(auth_payload)
+    response = make_response(redirect("/account"))
+    response.set_cookie(ACCOUNT_COOKIE_NAME, account_cookie_value(session_id), max_age=ACCOUNT_SESSION_SECONDS, secure=True, httponly=True, samesite="Lax")
+    return response
+
+
+@app.route("/login", methods=["GET", "POST"])
+def account_login():
+    if current_account_session()[1]:
+        return redirect("/account")
+    if request.method == "GET":
+        return login_form()
+
+    identifier = request.form.get("identifier", "").strip()
+    password = request.form.get("password", "")
+    email = lookup_email_for_identifier(identifier)
+    if not email:
+        return login_form("The email/username or password was not accepted."), 401
+
+    auth_payload, error = supabase_password_login(email, password)
+    if error:
+        return login_form("The email/username or password was not accepted."), 401
+
+    session_id = create_account_session(auth_payload)
+    response = make_response(redirect("/account"))
+    response.set_cookie(ACCOUNT_COOKIE_NAME, account_cookie_value(session_id), max_age=ACCOUNT_SESSION_SECONDS, secure=True, httponly=True, samesite="Lax")
+    return response
+
+
+@app.route("/logout", methods=["POST"])
+def account_logout():
+    session_id, session_data = current_account_session()
+    if session_data:
+        try:
+            requests.post(
+                f"{supabase_url()}/auth/v1/logout",
+                headers=supabase_headers(supabase_publishable_key(), session_data.get("access_token")),
+                timeout=15,
+            )
+        except requests.RequestException:
+            app.logger.warning("Supabase logout request failed")
+    delete_browser_session(session_id)
+    response = make_response(redirect("/login"))
+    response.delete_cookie(ACCOUNT_COOKIE_NAME, secure=True, httponly=True, samesite="Lax")
+    return response
+
+
+@app.route("/account")
+def account():
+    _, session_data = current_account_session()
+    if not session_data:
+        return redirect("/login")
+
+    profile = supabase_profile(session_data["user_id"], session_data["access_token"])
+    if not profile:
+        return account_page("Account error", """
+<h1>Account unavailable</h1><p class="error">You are logged in, but the matching profile record could not be loaded.</p>"""), 500
+
+    return account_page("Account", f"""
+<h1>{escape(profile.get("display_name") or profile["username"])}</h1>
+<p class="success">Browser account authentication is working.</p>
+<dl><dt>Username</dt><dd>{escape(profile.get("username") or "")}</dd>
+<dt>Email</dt><dd>{escape(profile.get("email") or session_data.get("email") or "")}</dd>
+<dt>Time zone</dt><dd>{escape(profile.get("timezone") or "")}</dd>
+<dt>Units</dt><dd>{escape(profile.get("units") or "")}</dd>
+<dt>Onboarding</dt><dd>{"Complete" if profile.get("onboarding_completed") else "Not yet complete"}</dd></dl>
+<p>Fitness-service connections will be attached to this account in the next step.</p>
+<form method="post" action="/logout"><button class="secondary" type="submit">Log out</button></form>""")
+
+
 SETUP_COOKIE_NAME = "fitness_setup_session"
 SETUP_SESSION_SECONDS = 1800
 
@@ -240,7 +585,7 @@ def setup_dashboard(user_id, message=None):
     <h1>Fitness account setup</h1>
     <p>Setting up accounts for <strong>{user_id}</strong>.</p>
     {message_html}
-    <p><a href="/login">Connect or reconnect Strava</a></p>
+    <p><a href="/connect/strava">Connect or reconnect Strava</a></p>
     <p><a href="/connect/withings">Connect or reconnect Withings</a></p>
     <form method="post" action="/setup/logout">
       <button type="submit">Finish setup / switch user</button>
@@ -251,7 +596,8 @@ def setup_dashboard(user_id, message=None):
 def home():
     return """
     <h1>Fitness GPT backend is running</h1>
-    <p><a href="/setup">Set up or reconnect user accounts</a></p>
+    <p><a href="/account">Account login and profile</a></p>
+    <p><a href="/setup">Legacy API-key setup</a></p>
     <p><a href="/workouts">View workouts</a></p>
     <p><a href="/summary">View summary</a></p>
     """
@@ -294,8 +640,8 @@ def setup_logout():
     return response
 
 
-@app.route("/login")
-def login():
+@app.route("/connect/strava")
+def connect_strava():
     user_id = read_setup_session()
     if not user_id:
         return redirect("/setup")
