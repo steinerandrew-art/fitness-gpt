@@ -1049,6 +1049,66 @@ def onboarding_goals(session_data):
 </form>""")
 
 
+def integration_placeholder_page(session_data, current_key, title, explanation):
+    user_id = session_data["user_id"]
+    token = session_data["access_token"]
+    profile = supabase_profile(user_id, token)
+    training = coaching_profile(user_id, token)
+    context = coaching_context(user_id, token)
+    goals = coaching_goals(user_id, token)
+    state = onboarding_state(profile, training, context, goals)
+
+    return account_page(
+        title,
+        f"""
+{onboarding_progress_html(state, current_key)}
+<h1>{escape(title)}</h1>
+<p>{escape(explanation)}</p>
+<p>
+  Your completed profile, training preferences, coaching context, and goals
+  have been saved. This connection stage has not been implemented yet.
+</p>
+<div class="actions">
+  <a class="button" href="/account">Return to account</a>
+  <a href="/onboarding/goals">Edit goals</a>
+</div>
+""",
+    )
+
+
+@app.route("/onboarding/strava")
+@require_account
+def onboarding_strava(session_data):
+    return integration_placeholder_page(
+        session_data,
+        "strava",
+        "Connect Strava",
+        "The next development step will connect Strava to the signed-in account.",
+    )
+
+
+@app.route("/onboarding/withings")
+@require_account
+def onboarding_withings(session_data):
+    return integration_placeholder_page(
+        session_data,
+        "withings",
+        "Connect Withings",
+        "Withings account linking will follow the authenticated Strava connection.",
+    )
+
+
+@app.route("/onboarding/integrations")
+@require_account
+def onboarding_integrations(session_data):
+    return integration_placeholder_page(
+        session_data,
+        "integrations",
+        "AI integrations",
+        "AI-provider configuration has not been implemented yet.",
+    )
+
+
 @app.route("/account")
 @require_account
 def account(session_data):
