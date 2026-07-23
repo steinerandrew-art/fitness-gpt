@@ -30,6 +30,7 @@ from training_zones import summarize_power_stream_intensity
 from withings_client import (
     get_withings_summary,
     exchange_withings_code,
+    withings_connection,
     WITHINGS_CLIENT_ID,
     WITHINGS_REDIRECT_URI,
 )
@@ -345,7 +346,7 @@ def supabase_profile(user_id, access_token):
             "select": ("id,username,email,display_name,timezone,units,date_of_birth,"
                        "biological_sex,height_value,height_source,weather_location,"
                        "max_hr_override,resting_hr_override,ftp_override,"
-                       "onboarding_completed,created_at"),
+                       "withings_onboarding_status,onboarding_completed,created_at"),
             "id": f"eq.{user_id}",
             "limit": "1",
         },
@@ -675,15 +676,26 @@ def account_onboarding_state(user_id, token):
     training = coaching_profile(user_id, token)
     context = coaching_context(user_id, token)
     goals = coaching_goals(user_id, token)
-    connection = strava_connection(user_id)
+    strava_status = strava_connection(user_id)
+    withings_status = withings_connection(user_id)
+    withings_skipped = bool(
+        profile and profile.get("withings_onboarding_status") == "skipped"
+    )
     state = onboarding_state(
         profile,
         training,
         context,
         goals,
-        integrations={"strava": connection["connected"]},
+        integrations={
+            "strava": strava_status["connected"],
+            "withings": withings_status["connected"],
+            "withings_skipped": withings_skipped,
+        },
     )
-    return profile, training, context, goals, connection, state
+    return (
+        profile, training, context, goals,
+        strava_status, withings_status, withings_skipped, state,
+    )
 
 
 @app.route("/onboarding")
@@ -1097,7 +1109,7 @@ def integration_placeholder_page(session_data, current_key, title, explanation):
 @require_account
 def onboarding_strava(session_data):
     user_id, token = session_data["user_id"], session_data["access_token"]
-    profile, training, context, goals, connection, state = account_onboarding_state(user_id, token)
+    profile, training, context, goals, connection, _, _, state = account_onboarding_state(user_id, token)
     if not goals_step_complete(goals):
         return redirect("/onboarding/goals")
 
@@ -1156,12 +1168,99 @@ def account_disconnect_strava(session_data):
 @app.route("/onboarding/withings")
 @require_account
 def onboarding_withings(session_data):
-    return integration_placeholder_page(
-        session_data,
+    user_id, token = session_data["user_id"], session_data["access_token"]
+    (
+        profile, training, context, goals,
+        strava_status, connection, skipped, state,
+    ) = account_onboarding_state(user_id, token)
+
+    if not strava_status["connected"]:
+        return redirect("/onboarding/strava")
+
+    if connection["connected"]:
+        status_html = """
+<p class="success"><strong>Withings connected.</strong></p>
+<p>Body measurements can now supplement the coaching summary for this account.</p>
+<div class="actions">
+  <a class="button" href="/onboarding/integrations">Continue</a>
+  <a href="/account/connect/withings">Reconnect Withings</a>
+</div>
+<form method="post" action="/account/disconnect/withings">
+  <button class="secondary" type="submit">Disconnect Withings from this account</button>
+</form>
+"""
+    elif skipped:
+        status_html = """
+<p><strong>Withings is currently skipped.</strong></p>
+<p>This does not block onboarding or Strava-based coaching. You can connect it now or later.</p>
+<div class="actions">
+  <a class="button" href="/onboarding/integrations">Continue</a>
+  <a href="/account/connect/withings">Connect Withings</a>
+</div>
+"""
+    else:
+        status_html = """
+<p>Withings is optional. Connecting it adds weight and body-composition trends to coaching.</p>
+<div class="actions">
+  <a class="button" href="/account/connect/withings">Connect Withings</a>
+</div>
+<form method="post" action="/account/skip/withings">
+  <button class="secondary" type="submit">Skip Withings for now</button>
+</form>
+"""
+
+    return account_page("Connect Withings", f"""
+{onboarding_progress_html(state, "withings")}
+<h1>Connect Withings</h1>
+{status_html}
+""")
+
+
+@app.route("/account/connect/withings")
+@require_account
+def account_connect_withings(session_data):
+    state = create_oauth_state(
+        session_data["user_id"],
         "withings",
-        "Connect Withings",
-        "Withings account linking will follow the authenticated Strava connection.",
+        flow="account",
     )
+    auth_url = (
+        "https://account.withings.com/oauth2_user/authorize2"
+        "?response_type=code"
+        f"&client_id={WITHINGS_CLIENT_ID}"
+        f"&redirect_uri={WITHINGS_REDIRECT_URI}"
+        "&scope=user.info,user.metrics"
+        f"&state={state}"
+    )
+    return redirect(auth_url)
+
+
+@app.route("/account/skip/withings", methods=["POST"])
+@require_account
+def account_skip_withings(session_data):
+    _, error = update_supabase_profile(
+        session_data["user_id"],
+        session_data["access_token"],
+        {"withings_onboarding_status": "skipped"},
+    )
+    if error:
+        return account_page(
+            "Withings error",
+            f'<h1>Could not skip Withings</h1><p class="error">{escape(error)}</p>',
+        ), 500
+    return redirect("/onboarding/integrations")
+
+
+@app.route("/account/disconnect/withings", methods=["POST"])
+@require_account
+def account_disconnect_withings(session_data):
+    delete_service_tokens("withings", session_data["user_id"])
+    update_supabase_profile(
+        session_data["user_id"],
+        session_data["access_token"],
+        {"withings_onboarding_status": "skipped"},
+    )
+    return redirect("/onboarding/withings")
 
 
 @app.route("/onboarding/integrations")
@@ -1179,7 +1278,7 @@ def onboarding_integrations(session_data):
 @require_account
 def account(session_data):
     user_id, token = session_data["user_id"], session_data["access_token"]
-    profile, training, context, goals, strava_status, state = account_onboarding_state(user_id, token)
+    profile, training, context, goals, strava_status, withings_status, withings_skipped, state = account_onboarding_state(user_id, token)
     if not profile:
         return account_page("Account error", '<h1>Account unavailable</h1>'), 500
     next_step = state["next_step"]
@@ -1194,6 +1293,7 @@ def account(session_data):
         '<a href="/onboarding/context">Edit coaching context</a>',
         '<a href="/onboarding/goals">Edit goals</a>',
         '<a href="/onboarding/strava">Strava connection</a>',
+        '<a href="/onboarding/withings">Withings connection</a>',
     ])
     return account_page("Account", f"""
 <h1>{escape(profile.get("display_name") or profile["username"])}</h1>
@@ -1204,6 +1304,7 @@ def account(session_data):
 <dt>Coaching context</dt><dd>{"Configured" if context_step_complete(context) else "Not configured"}</dd>
 <dt>Goals</dt><dd>{len(goals)} configured</dd>
 <dt>Strava</dt><dd>{"Connected" if strava_status["connected"] else "Not connected"}</dd>
+<dt>Withings</dt><dd>{"Connected" if withings_status["connected"] else ("Skipped" if withings_skipped else "Not configured")}</dd>
 <dt>Onboarding</dt><dd>{"Complete" if state["complete"] else "In progress"}</dd>
 </dl>{next_html}<p>{links}</p>
 <form method="post" action="/logout"><button class="secondary" type="submit">Log out</button></form>""")
@@ -1581,31 +1682,43 @@ def connect_withings():
 @app.route("/callback/withings")
 def callback_withings():
     code = request.args.get("code")
-    error = request.args.get("error")
-    user_id = read_oauth_state(request.args.get("state"), "withings")
+    authorization_error = request.args.get("error")
+    payload = read_oauth_state_payload(request.args.get("state"), "withings")
 
-    if not user_id:
+    if not payload:
         return "Invalid or expired OAuth state", 400
 
-    if error:
-        return f"Withings authorization failed: {error}", 400
+    user_id = payload["user_id"]
+    flow = payload.get("flow", "legacy")
+
+    if authorization_error:
+        if flow == "account":
+            return redirect("/onboarding/withings?error=authorization_denied")
+        return f"Withings authorization failed: {authorization_error}", 400
 
     if not code:
         return "Missing Withings authorization code", 400
 
     token_data, token_error = exchange_withings_code(code, user_id=user_id)
-
     if token_error:
         message, status = token_error
         return jsonify({
             "error": "Withings token exchange failed",
-            "details": message
+            "details": message,
         }), status
 
-    return setup_dashboard(
-        user_id,
-        "Withings connected successfully.",
-    )
+    if flow == "account":
+        _, current_session = current_account_session()
+        if not current_session or current_session.get("user_id") != user_id:
+            return redirect("/login")
+        update_supabase_profile(
+            user_id,
+            current_session["access_token"],
+            {"withings_onboarding_status": "connected"},
+        )
+        return redirect("/onboarding/withings?connected=1")
+
+    return setup_dashboard(user_id, "Withings connected successfully.")
 
 
 def build_coaching_insights(summary_data, withings_data):
@@ -1965,7 +2078,7 @@ def summary(user_id):
         missing_sources = ["withings"]
 
     summary_data = {
-        "debug_version": "multiuser-step14-11-training-state-machine",
+        "debug_version": "multiuser-step15-11-training-state-machine",
         "user_id": user_id,
         "period_days": 14,
         "workout_count": workout_count,

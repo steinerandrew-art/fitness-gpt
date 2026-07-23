@@ -121,7 +121,7 @@ def onboarding_state(profile, training, context=None, goals=None, integrations=N
         "context": context_step_complete(context),
         "goals": goals_step_complete(goals),
         "strava": bool(integrations.get("strava")),
-        "withings": bool(integrations.get("withings")),
+        "withings": bool(integrations.get("withings")) or bool(integrations.get("withings_skipped")),
         "integrations": bool(integrations.get("ai")),
     }
     next_step = next(

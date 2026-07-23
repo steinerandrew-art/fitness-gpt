@@ -1,40 +1,32 @@
+from datetime import datetime, timedelta, timezone
 import os
 import time
-from datetime import datetime, timedelta, timezone
 
 import requests
 
-from token_store import (
-    DEFAULT_USER_ID,
-    get_service_tokens,
-    save_service_tokens,
-)
+from token_store import DEFAULT_USER_ID, get_service_tokens, save_service_tokens
 
 
 WITHINGS_CLIENT_ID = os.environ["WITHINGS_CLIENT_ID"]
 WITHINGS_CLIENT_SECRET = os.environ["WITHINGS_CLIENT_SECRET"]
 WITHINGS_REDIRECT_URI = os.environ["WITHINGS_REDIRECT_URI"]
-
-# Temporary fallback for the existing single-user deployment.
-# This can be removed after all users have migrated to Redis-backed tokens.
 WITHINGS_REFRESH_TOKEN = os.getenv("WITHINGS_REFRESH_TOKEN")
 
 
 def get_withings_tokens(user_id=DEFAULT_USER_ID):
-    """
-    Loads the latest Withings tokens for the requested user from Redis.
-    """
     return get_service_tokens("withings", user_id)
 
 
-def refresh_withings_access_token(user_id=DEFAULT_USER_ID):
-    """
-    Refreshes the requested user's Withings access token.
+def withings_connection(user_id=DEFAULT_USER_ID):
+    tokens = get_withings_tokens(user_id)
+    return {
+        "connected": bool(tokens.get("refresh_token") or tokens.get("access_token")),
+        "withings_user_id": tokens.get("userid"),
+        "expires_at": tokens.get("expires_at"),
+    }
 
-    Returns:
-        (access_token, None) on success
-        (None, (message, status_code)) on failure
-    """
+
+def refresh_withings_access_token(user_id=DEFAULT_USER_ID):
     tokens = get_withings_tokens(user_id)
     refresh_token = tokens.get("refresh_token")
 
@@ -42,7 +34,7 @@ def refresh_withings_access_token(user_id=DEFAULT_USER_ID):
         refresh_token = WITHINGS_REFRESH_TOKEN
 
     if not refresh_token:
-        return None, ("Withings is not connected", 401)
+        return None
 
     response = requests.post(
         "https://wbsapi.withings.net/v2/oauth2",
@@ -59,56 +51,36 @@ def refresh_withings_access_token(user_id=DEFAULT_USER_ID):
     try:
         data = response.json()
     except ValueError:
-        return None, (response.text or "Invalid Withings response", response.status_code)
+        return None
 
     if response.status_code != 200 or data.get("status") != 0:
-        return None, (
-            data.get("error") or data.get("body") or response.text or "Withings token refresh failed",
-            response.status_code,
-        )
+        return None
 
-    body = data.get("body", {})
-
-    refreshed_tokens = {
+    body = data.get("body") or {}
+    save_service_tokens("withings", {
         "access_token": body.get("access_token"),
         "refresh_token": body.get("refresh_token"),
-        "userid": body.get("userid"),
-        "expires_at": time.time() + body.get("expires_in", 10800),
-    }
+        "userid": body.get("userid") or tokens.get("userid"),
+        "expires_at": int(time.time()) + int(body.get("expires_in", 10800)),
+    }, user_id)
 
-    save_service_tokens("withings", refreshed_tokens, user_id)
-
-    return refreshed_tokens["access_token"], None
+    return body.get("access_token")
 
 
 def ensure_withings_access_token(user_id=DEFAULT_USER_ID):
-    """
-    Returns a valid Withings access token, refreshing it when necessary.
-    """
     tokens = get_withings_tokens(user_id)
-
     access_token = tokens.get("access_token")
-    expires_at = tokens.get("expires_at", 0)
-
     try:
-        expires_at = float(expires_at)
+        expires_at = float(tokens.get("expires_at") or 0)
     except (TypeError, ValueError):
         expires_at = 0
 
     if access_token and time.time() < expires_at - 60:
-        return access_token, None
-
+        return access_token
     return refresh_withings_access_token(user_id)
 
 
 def exchange_withings_code(code, user_id=DEFAULT_USER_ID):
-    """
-    Exchanges a Withings authorization code for user-specific tokens.
-
-    Returns:
-        (token_body, None) on success
-        (None, (message, status_code)) on failure
-    """
     response = requests.post(
         "https://wbsapi.withings.net/v2/oauth2",
         data={
@@ -125,40 +97,26 @@ def exchange_withings_code(code, user_id=DEFAULT_USER_ID):
     try:
         data = response.json()
     except ValueError:
-        return None, (response.text or "Invalid Withings response", response.status_code)
+        return None, (response.text, response.status_code)
 
     if response.status_code != 200 or data.get("status") != 0:
-        return None, (
-            data.get("error") or data.get("body") or response.text or "Withings token exchange failed",
-            response.status_code,
-        )
+        return None, (data, response.status_code or 400)
 
-    body = data.get("body", {})
-
-    tokens = {
+    body = data.get("body") or {}
+    save_service_tokens("withings", {
         "access_token": body.get("access_token"),
         "refresh_token": body.get("refresh_token"),
         "userid": body.get("userid"),
-        "expires_at": time.time() + body.get("expires_in", 10800),
-    }
-
-    save_service_tokens("withings", tokens, user_id)
+        "expires_at": int(time.time()) + int(body.get("expires_in", 10800)),
+    }, user_id)
 
     return body, None
 
 
 def get_withings_measures(user_id=DEFAULT_USER_ID):
-    """
-    Retrieves the requested user's recent Withings measurements.
-
-    Returns:
-        (body, None) on success
-        (None, (message, status_code)) on failure
-    """
-    access_token, token_error = ensure_withings_access_token(user_id)
-
-    if token_error:
-        return None, token_error
+    access_token = ensure_withings_access_token(user_id)
+    if not access_token:
+        return None, ("Not connected to Withings", 401)
 
     enddate = int(datetime.now(timezone.utc).timestamp())
     startdate = int((datetime.now(timezone.utc) - timedelta(days=14)).timestamp())
@@ -172,38 +130,28 @@ def get_withings_measures(user_id=DEFAULT_USER_ID):
             "startdate": startdate,
             "enddate": enddate,
         },
-        headers={
-            "Authorization": f"Bearer {access_token}"
-        },
+        headers={"Authorization": f"Bearer {access_token}"},
         timeout=30,
     )
 
     try:
         data = response.json()
     except ValueError:
-        return None, (response.text or "Invalid Withings response", response.status_code)
+        return None, (response.text, response.status_code)
 
     if response.status_code != 200 or data.get("status") != 0:
-        return None, (
-            data.get("error") or data.get("body") or response.text or "Withings measurement request failed",
-            response.status_code,
-        )
+        return None, (data, response.status_code or 400)
 
     return data.get("body", {}), None
 
 
 def get_withings_summary(user_id=DEFAULT_USER_ID):
     body, error = get_withings_measures(user_id)
-
     if error:
-        message, status = error
-        return {
-            "status": "not_connected" if status == 401 else "temporarily_unavailable",
-            "message": str(message),
-        }
+        status_code = error[1] if isinstance(error, tuple) and len(error) > 1 else None
+        return {"status": "not_connected" if status_code == 401 else "temporarily_unavailable"}
 
     measure_groups = body.get("measuregrps", [])
-
     parsed_groups = [
         parse_measure_group(group)
         for group in measure_groups
@@ -250,79 +198,45 @@ def parse_measure_group(group):
     }
 
     for measure in group.get("measures", []):
-        measure_type = measure.get("type")
-        field_name = MEASURE_TYPES.get(measure_type)
-
-        if not field_name:
-            continue
-
-        parsed["measurements"][field_name] = round(
-            convert_measure_value(measure), 3
-        )
+        field_name = MEASURE_TYPES.get(measure.get("type"))
+        if field_name:
+            parsed["measurements"][field_name] = round(convert_measure_value(measure), 3)
 
     if "weight_kg" in parsed["measurements"]:
         parsed["measurements"]["weight_lb"] = round(
             parsed["measurements"]["weight_kg"] * 2.20462, 1
         )
-
     return parsed
 
 
 def average(values):
-    clean_values = [value for value in values if value is not None]
-
-    if not clean_values:
-        return None
-
-    return sum(clean_values) / len(clean_values)
+    clean = [value for value in values if value is not None]
+    return sum(clean) / len(clean) if clean else None
 
 
 def calculate_weight_trends(parsed_groups):
-    """
-    parsed_groups should be newest-first.
-    """
     weights = [
         group.get("measurements", {}).get("weight_lb")
         for group in parsed_groups
         if group.get("measurements", {}).get("weight_lb") is not None
     ]
-
     if len(weights) < 2:
-        return {
-            "status": "insufficient_data"
-        }
+        return {"status": "insufficient_data"}
 
-    simple_change = weights[0] - weights[-1]
-
-    recent_count = min(3, len(weights))
-    older_count = min(3, len(weights))
-
-    recent_avg = average(weights[:recent_count])
-    older_avg = average(weights[-older_count:])
-
-    smoothed_change = None
-    if recent_avg is not None and older_avg is not None:
-        smoothed_change = recent_avg - older_avg
-
+    recent_avg = average(weights[:min(3, len(weights))])
+    older_avg = average(weights[-min(3, len(weights)):])
+    smoothed_change = (
+        recent_avg - older_avg
+        if recent_avg is not None and older_avg is not None
+        else None
+    )
     return {
         "status": "ok",
-        "weight_change_simple_lb": round(simple_change, 1),
-        "weight_change_smoothed_lb": (
-            round(smoothed_change, 1)
-            if smoothed_change is not None
-            else None
-        ),
+        "weight_change_simple_lb": round(weights[0] - weights[-1], 1),
+        "weight_change_smoothed_lb": round(smoothed_change, 1) if smoothed_change is not None else None,
         "latest_weight_lb": round(weights[0], 1),
         "oldest_weight_lb": round(weights[-1], 1),
-        "latest_3_avg_weight_lb": (
-            round(recent_avg, 1)
-            if recent_avg is not None
-            else None
-        ),
-        "oldest_3_avg_weight_lb": (
-            round(older_avg, 1)
-            if older_avg is not None
-            else None
-        ),
+        "latest_3_avg_weight_lb": round(recent_avg, 1) if recent_avg is not None else None,
+        "oldest_3_avg_weight_lb": round(older_avg, 1) if older_avg is not None else None,
         "measurement_count": len(weights),
     }
