@@ -1893,7 +1893,7 @@ def api_whoami(user_id):
 def api_context(user_id):
     payload = api_coaching_context(user_id)
     payload["user_id"] = user_id
-    payload["debug_version"] = "multiuser-step17a-coaching-api"
+    payload["debug_version"] = "multiuser-step17b-coaching-api"
     return jsonify(payload)
 
 
@@ -1911,10 +1911,12 @@ def openapi_schema():
         },
         "servers": [{"url": server_url}],
         "components": {
+            "schemas": {},
             "securitySchemes": {
                 "bearerAuth": {
                     "type": "http",
                     "scheme": "bearer",
+                    "bearerFormat": "API key",
                 }
             }
         },
@@ -1924,28 +1926,64 @@ def openapi_schema():
                 "get": {
                     "operationId": "getCurrentFitnessAccount",
                     "summary": "Identify the connected fitness account",
-                    "responses": {"200": {"description": "Connected account identity"}},
+                    "responses": {
+                        "200": {
+                            "description": "Connected account identity",
+                            "content": {
+                                "application/json": {
+                                    "schema": {"type": "object"}
+                                }
+                            },
+                        }
+                    },
                 }
             },
             "/coaching-context": {
                 "get": {
                     "operationId": "getCoachingContext",
                     "summary": "Get profile, preferences, constraints, and goals",
-                    "responses": {"200": {"description": "Coaching context"}},
+                    "responses": {
+                        "200": {
+                            "description": "Coaching context",
+                            "content": {
+                                "application/json": {
+                                    "schema": {"type": "object"}
+                                }
+                            },
+                        }
+                    },
                 }
             },
             "/summary": {
                 "get": {
                     "operationId": "getFitnessSummary",
                     "summary": "Get the current 14-day fitness and readiness summary",
-                    "responses": {"200": {"description": "Fitness summary"}},
+                    "responses": {
+                        "200": {
+                            "description": "Fitness summary",
+                            "content": {
+                                "application/json": {
+                                    "schema": {"type": "object"}
+                                }
+                            },
+                        }
+                    },
                 }
             },
             "/workouts": {
                 "get": {
                     "operationId": "getRecentWorkouts",
                     "summary": "Get recent workouts with available zone data",
-                    "responses": {"200": {"description": "Recent workouts"}},
+                    "responses": {
+                        "200": {
+                            "description": "Recent workouts",
+                            "content": {
+                                "application/json": {
+                                    "schema": {"type": "object"}
+                                }
+                            },
+                        }
+                    },
                 }
             },
             "/activity/{activity_id}": {
@@ -1958,7 +1996,16 @@ def openapi_schema():
                         "required": True,
                         "schema": {"type": "integer"},
                     }],
-                    "responses": {"200": {"description": "Activity detail"}},
+                    "responses": {
+                        "200": {
+                            "description": "Activity detail",
+                            "content": {
+                                "application/json": {
+                                    "schema": {"type": "object"}
+                                }
+                            },
+                        }
+                    },
                 }
             },
             "/activity/{activity_id}/zones": {
@@ -1971,7 +2018,16 @@ def openapi_schema():
                         "required": True,
                         "schema": {"type": "integer"},
                     }],
-                    "responses": {"200": {"description": "Activity zones"}},
+                    "responses": {
+                        "200": {
+                            "description": "Activity zones",
+                            "content": {
+                                "application/json": {
+                                    "schema": {"type": "object"}
+                                }
+                            },
+                        }
+                    },
                 }
             },
         },
