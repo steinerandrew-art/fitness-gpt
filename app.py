@@ -410,6 +410,90 @@ def upsert_ai_integration(user_id, access_token, values):
     rows = response.json()
     return (rows[0] if rows else payload), None
 
+
+def service_single_row(table, user_id, id_column="user_id", select="*"):
+    response = requests.get(
+        f"{supabase_url()}/rest/v1/{table}",
+        headers=supabase_headers(supabase_secret_key(), supabase_secret_key()),
+        params={
+            "select": select,
+            id_column: f"eq.{user_id}",
+            "limit": "1",
+        },
+        timeout=15,
+    )
+    if response.status_code != 200:
+        app.logger.warning(
+            "Service lookup failed for %s: %s",
+            table,
+            supabase_error_message(response, "unknown error"),
+        )
+        return None
+    rows = response.json()
+    return rows[0] if rows else None
+
+
+def service_coaching_goals(user_id):
+    response = requests.get(
+        f"{supabase_url()}/rest/v1/coaching_goals",
+        headers=supabase_headers(supabase_secret_key(), supabase_secret_key()),
+        params={
+            "select": (
+                "id,user_id,priority,title,status,priority_level,"
+                "description,created_at,updated_at"
+            ),
+            "user_id": f"eq.{user_id}",
+            "order": "priority.asc",
+        },
+        timeout=15,
+    )
+    if response.status_code != 200:
+        app.logger.warning(
+            "Service coaching goals lookup failed: %s",
+            supabase_error_message(response, "unknown error"),
+        )
+        return []
+    return response.json()
+
+
+def api_coaching_context(user_id):
+    profile = service_single_row(
+        "profiles",
+        user_id,
+        id_column="id",
+        select=(
+            "id,username,display_name,timezone,units,date_of_birth,"
+            "biological_sex,height_value,height_source,weather_location,"
+            "max_hr_override,resting_hr_override,ftp_override,"
+            "withings_onboarding_status,onboarding_completed"
+        ),
+    )
+    training = service_single_row(
+        "coaching_profiles",
+        user_id,
+        select=(
+            "user_id,primary_focus,activity_preferences,weekday_minutes,"
+            "weekend_minutes,coaching_style,equipment,indoor_platforms,"
+            "bad_weather_strategy,created_at,updated_at"
+        ),
+    )
+    context = service_single_row(
+        "coaching_contexts",
+        user_id,
+        select=(
+            "user_id,coaching_preferences,training_philosophy,"
+            "lifestyle_constraints,additional_context,created_at,updated_at"
+        ),
+    )
+    goals = service_coaching_goals(user_id)
+
+    return {
+        "profile": profile or {},
+        "training_profile": training or {},
+        "coaching_context": context or {},
+        "goals": goals,
+    }
+
 def supabase_profile(user_id, access_token):
     response = requests.get(
         f"{supabase_url()}/rest/v1/profiles",
@@ -1418,6 +1502,9 @@ def onboarding_integrations(session_data):
 <h2>Client setup</h2>
 <p>Configure the AI client to send the key in this HTTP header:</p>
 <p><code>Authorization: Bearer &lt;your API key&gt;</code></p>
+<p>For clients that can import an OpenAPI schema, use:</p>
+<p><code>{escape(request.url_root.rstrip("/") + "/openapi.json")}</code></p>
+<p>After configuration, call <code>/whoami</code> first. Then retrieve both <code>/coaching-context</code> and <code>/summary</code> before giving individualized coaching advice.</p>
 <p class="muted">Replacing or revoking the key immediately disables the previous key. Generate a separate replacement whenever a key may have been exposed.</p>
 """)
 
@@ -1705,6 +1792,117 @@ def exchange_token():
     ) or "the selected account"
     return setup_dashboard(user_id, f"Strava connected successfully for {athlete_name}.")
 
+
+
+@app.route("/whoami")
+@require_api_user
+def api_whoami(user_id):
+    profile = service_single_row(
+        "profiles",
+        user_id,
+        id_column="id",
+        select="id,username,display_name,timezone,units,onboarding_completed",
+    ) or {}
+
+    return jsonify({
+        "authentication": "api_key",
+        "user_id": user_id,
+        "username": profile.get("username"),
+        "display_name": profile.get("display_name"),
+        "timezone": profile.get("timezone"),
+        "units": profile.get("units"),
+        "onboarding_completed": bool(profile.get("onboarding_completed")),
+    })
+
+
+@app.route("/coaching-context")
+@require_api_user
+def api_context(user_id):
+    payload = api_coaching_context(user_id)
+    payload["user_id"] = user_id
+    payload["debug_version"] = "multiuser-step17-coaching-api"
+    return jsonify(payload)
+
+
+@app.route("/openapi.json")
+def openapi_schema():
+    server_url = request.url_root.rstrip("/")
+    return jsonify({
+        "openapi": "3.1.0",
+        "info": {
+            "title": "Fitness Coaching API",
+            "version": "1.0.0",
+            "description": (
+                "Account-scoped fitness and coaching context for an AI coaching client."
+            ),
+        },
+        "servers": [{"url": server_url}],
+        "components": {
+            "securitySchemes": {
+                "bearerAuth": {
+                    "type": "http",
+                    "scheme": "bearer",
+                }
+            }
+        },
+        "security": [{"bearerAuth": []}],
+        "paths": {
+            "/whoami": {
+                "get": {
+                    "operationId": "getCurrentFitnessAccount",
+                    "summary": "Identify the connected fitness account",
+                    "responses": {"200": {"description": "Connected account identity"}},
+                }
+            },
+            "/coaching-context": {
+                "get": {
+                    "operationId": "getCoachingContext",
+                    "summary": "Get profile, preferences, constraints, and goals",
+                    "responses": {"200": {"description": "Coaching context"}},
+                }
+            },
+            "/summary": {
+                "get": {
+                    "operationId": "getFitnessSummary",
+                    "summary": "Get the current 14-day fitness and readiness summary",
+                    "responses": {"200": {"description": "Fitness summary"}},
+                }
+            },
+            "/workouts": {
+                "get": {
+                    "operationId": "getRecentWorkouts",
+                    "summary": "Get recent workouts with available zone data",
+                    "responses": {"200": {"description": "Recent workouts"}},
+                }
+            },
+            "/activity/{activity_id}": {
+                "get": {
+                    "operationId": "getActivityDetail",
+                    "summary": "Get detail for one activity",
+                    "parameters": [{
+                        "name": "activity_id",
+                        "in": "path",
+                        "required": True,
+                        "schema": {"type": "integer"},
+                    }],
+                    "responses": {"200": {"description": "Activity detail"}},
+                }
+            },
+            "/activity/{activity_id}/zones": {
+                "get": {
+                    "operationId": "getActivityZones",
+                    "summary": "Get zone data for one activity",
+                    "parameters": [{
+                        "name": "activity_id",
+                        "in": "path",
+                        "required": True,
+                        "schema": {"type": "integer"},
+                    }],
+                    "responses": {"200": {"description": "Activity zones"}},
+                }
+            },
+        },
+    })
 
 @app.route("/activity/<int:activity_id>")
 @require_api_user
@@ -2292,7 +2490,7 @@ def summary(user_id):
         missing_sources = ["withings"]
 
     summary_data = {
-        "debug_version": "multiuser-step16-11-training-state-machine",
+        "debug_version": "multiuser-step17-11-training-state-machine",
         "user_id": user_id,
         "period_days": 14,
         "workout_count": workout_count,
