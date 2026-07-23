@@ -639,6 +639,7 @@ fieldset{{margin:20px 0;padding:16px;border:1px solid #dfe4ea;border-radius:10px
 .check-grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:10px 16px}} .check-grid label{{display:flex;align-items:flex-start;gap:8px;margin:0;font-weight:500}} .check-grid input{{width:auto;margin-top:3px}}
 .wizard-progress{{list-style:none;padding:0;margin:0 0 24px;display:grid;gap:8px}} .wizard-progress li{{display:flex;justify-content:space-between;padding:9px 12px;border-radius:8px;background:#f1f3f5}} .wizard-progress .complete{{background:#eafaf1}} .wizard-progress .current{{background:#eaf2f8;font-weight:700}}
 .actions{{display:flex;gap:12px;flex-wrap:wrap;align-items:center}} .muted{{color:#5d6d7e}}
+.table-scroll{{overflow-x:auto}} .preference-table{{width:100%;border-collapse:collapse}} .preference-table th,.preference-table td{{padding:8px;text-align:left;vertical-align:middle;border-bottom:1px solid #e5e8eb}} .preference-table thead th{{font-size:.9rem;color:#5d6d7e}} .preference-table tbody th{{width:64px;text-align:center}} .preference-table select{{min-width:190px}}
 </style></head><body><main>{body}</main></body></html>"""
 
 
@@ -892,32 +893,40 @@ def onboarding_training(session_data):
         ]
 
         activity_preferences = {}
-        priority_values = []
+        selected_activities = []
+        valid_activities = {key for key, _ in ACTIVITY_OPTIONS}
         valid_frequencies = {key for key, _ in ACTIVITY_FREQUENCY_OPTIONS}
-        for key, label in ACTIVITY_OPTIONS:
-            raw_priority = request.form.get(f"priority_{key}", "0")
-            frequency = request.form.get(f"frequency_{key}", "never")
-            try:
-                priority = int(raw_priority)
-            except ValueError:
-                priority = -1
-            if not 0 <= priority <= 5:
-                error_message = f"Priority for {label} must be between 0 and 5."
+
+        for priority in range(1, 6):
+            activity = request.form.get(f"activity_{priority}", "").strip()
+            frequency = request.form.get(f"frequency_{priority}", "").strip()
+
+            if not activity and not frequency:
+                continue
+            if not activity:
+                error_message = f"Choose an activity for priority {priority}."
+                break
+            if activity not in valid_activities:
+                error_message = f"Choose a valid activity for priority {priority}."
+                break
+            if not frequency:
+                error_message = f"Choose a frequency for priority {priority}."
                 break
             if frequency not in valid_frequencies:
-                error_message = f"Choose a valid frequency for {label}."
+                error_message = f"Choose a valid frequency for priority {priority}."
                 break
-            activity_preferences[key] = {
+            if activity in selected_activities:
+                error_message = "Each activity can appear only once in the priority list."
+                break
+
+            selected_activities.append(activity)
+            activity_preferences[activity] = {
                 "priority": priority,
                 "frequency": frequency,
             }
-            if priority > 0:
-                priority_values.append(priority)
 
-        if not error_message and not priority_values:
-            error_message = "Give at least one activity a priority from 1 to 5."
-        elif not error_message and len(priority_values) != len(set(priority_values)):
-            error_message = "Use each non-zero priority only once so the ranking is unambiguous."
+        if not error_message and not selected_activities:
+            error_message = "Choose at least one activity preference."
         elif not error_message and weekday_error:
             error_message = weekday_error
         elif not error_message and weekend_error:
@@ -985,32 +994,45 @@ def onboarding_training(session_data):
         for key, label in PLATFORM_OPTIONS
     )
 
-    frequency_options_by_activity = {}
+    saved_ranked_preferences = sorted(
+        (
+            (details.get("priority", 99), key, details.get("frequency", ""))
+            for key, details in saved_preferences.items()
+            if isinstance(details, dict) and details.get("priority")
+        ),
+        key=lambda item: item[0],
+    )
+    saved_by_priority = {
+        priority: (key, frequency)
+        for priority, key, frequency in saved_ranked_preferences
+        if 1 <= int(priority) <= 5
+    }
+
     activity_rows = []
-    for key, label in ACTIVITY_OPTIONS:
-        saved = saved_preferences.get(key) or {}
-        priority = request.form.get(
-            f"priority_{key}",
-            str(saved.get("priority", 0)),
+    for priority in range(1, 6):
+        if request.method == "POST":
+            selected_activity = request.form.get(f"activity_{priority}", "")
+            selected_frequency = request.form.get(f"frequency_{priority}", "")
+        else:
+            selected_activity, selected_frequency = saved_by_priority.get(
+                priority,
+                ("", ""),
+            )
+
+        activity_options = '<option value="">— Leave blank —</option>' + ''.join(
+            f'<option value="{escape(key)}" '
+            f'{"selected" if key == selected_activity else ""}>{escape(label)}</option>'
+            for key, label in ACTIVITY_OPTIONS
         )
-        frequency = request.form.get(
-            f"frequency_{key}",
-            saved.get("frequency", "never"),
-        )
-        priority_options = ''.join(
-            f'<option value="{value}" {"selected" if str(value) == str(priority) else ""}>'
-            f'{"Not ranked" if value == 0 else value}</option>'
-            for value in range(0, 6)
-        )
-        frequency_options = ''.join(
-            f'<option value="{escape(value)}" {"selected" if value == frequency else ""}>'
-            f'{escape(text)}</option>'
-            for value, text in ACTIVITY_FREQUENCY_OPTIONS
+        frequency_options = '<option value="">— Select frequency —</option>' + ''.join(
+            f'<option value="{escape(value)}" '
+            f'{"selected" if value == selected_frequency else ""}>{escape(label)}</option>'
+            for value, label in ACTIVITY_FREQUENCY_OPTIONS
         )
         activity_rows.append(
-            f'<div class="activity-row-label">{escape(label)}</div>'
-            f'<select name="priority_{escape(key)}" aria-label="Priority for {escape(label)}">{priority_options}</select>'
-            f'<select name="frequency_{escape(key)}" aria-label="Frequency for {escape(label)}">{frequency_options}</select>'
+            f'<tr><th scope="row">{priority}</th>'
+            f'<td><select name="activity_{priority}" aria-label="Activity for priority {priority}">{activity_options}</select></td>'
+            f'<td><select name="frequency_{priority}" aria-label="Frequency for priority {priority}">{frequency_options}</select></td></tr>'
         )
 
     error_html = f'<p class="error">{escape(error_message)}</p>' if error_message else ""
@@ -1020,11 +1042,11 @@ def onboarding_training(session_data):
         f"""
 {onboarding_progress_html(state, "training")}
 <h1>Training profile</h1>
-<p>Rank the activities you most want coaching to favor, and separately describe how often each is realistically available. Priority 1 is highest; leave activities unranked when they should rarely drive recommendations.</p>
+<p>List activities in the order you want coaching to favor them. Priority 1 is highest. Fill only as many rows as are useful; each selected activity also needs a realistic availability.</p>
 {error_html}
 <form method="post" action="/onboarding/training">
 <fieldset><legend>Activity preferences</legend>
-<div class="activity-grid"><div class="heading">Activity</div><div class="heading">Priority</div><div class="heading">Typical availability</div>{''.join(activity_rows)}</div>
+<div class="table-scroll"><table class="preference-table"><thead><tr><th>Priority</th><th>Activity</th><th>Typical availability</th></tr></thead><tbody>{''.join(activity_rows)}</tbody></table></div>
 </fieldset>
 <label for="weekday_minutes">Typical weekday workout duration</label>
 <input id="weekday_minutes" type="number" name="weekday_minutes" min="0" max="1440" step="5" value="{escape(str(weekday_minutes))}" required>
