@@ -335,6 +335,29 @@ def supabase_profile(user_id, access_token):
     return rows[0] if rows else None
 
 
+def update_supabase_profile(user_id, access_token, updates):
+    response = requests.patch(
+        f"{supabase_url()}/rest/v1/profiles",
+        headers={
+            **supabase_headers(supabase_publishable_key(), access_token),
+            "Prefer": "return=representation",
+        },
+        params={"id": f"eq.{user_id}"},
+        json=updates,
+        timeout=15,
+    )
+    if response.status_code not in {200, 204}:
+        message = supabase_error_message(
+            response,
+            "The profile could not be saved.",
+        )
+        app.logger.warning("Supabase profile update failed: %s", message)
+        return None, message
+
+    rows = response.json() if response.content else []
+    return (rows[0] if rows else updates), None
+
+
 def create_account_session(auth_payload):
     user = auth_payload.get("user") or {}
     session_id = secrets.token_urlsafe(32)
@@ -382,6 +405,17 @@ def current_account_session():
     return session_id, session_data
 
 
+def require_account(view_function):
+    @wraps(view_function)
+    def wrapped(*args, **kwargs):
+        _, session_data = current_account_session()
+        if not session_data:
+            return redirect("/login")
+        return view_function(session_data, *args, **kwargs)
+
+    return wrapped
+
+
 def account_page(title, body):
     return f"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
@@ -389,7 +423,7 @@ def account_page(title, body):
 <style>
 body{{margin:0;background:#f5f7fa;color:#17202a;font-family:system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}}
 main{{width:min(640px,calc(100% - 32px));margin:48px auto;background:white;border:1px solid #dfe4ea;border-radius:14px;padding:28px;box-shadow:0 8px 24px rgba(0,0,0,.06)}}
-h1{{margin-top:0}} label{{display:block;margin:16px 0 6px;font-weight:600}} input{{width:100%;box-sizing:border-box;padding:11px;border:1px solid #aab2bd;border-radius:8px;font:inherit}}
+h1{{margin-top:0}} label{{display:block;margin:16px 0 6px;font-weight:600}} input,select{{width:100%;box-sizing:border-box;padding:11px;border:1px solid #aab2bd;border-radius:8px;font:inherit}} code{{background:#eef1f4;border-radius:4px;padding:2px 5px}}
 button,.button{{display:inline-block;margin-top:20px;padding:11px 16px;border:0;border-radius:8px;background:#1f5f99;color:white;font:inherit;font-weight:650;text-decoration:none;cursor:pointer}}
 .secondary{{background:#5d6d7e}} .error{{padding:12px;border-radius:8px;background:#fdecea;color:#922b21}} .success{{padding:12px;border-radius:8px;background:#eafaf1;color:#196f3d}}
 dl{{display:grid;grid-template-columns:150px 1fr;gap:10px 16px}} dt{{font-weight:700}} dd{{margin:0}}
@@ -492,27 +526,121 @@ def account_logout():
     return response
 
 
-@app.route("/account")
-def account():
-    _, session_data = current_account_session()
-    if not session_data:
-        return redirect("/login")
+@app.route("/onboarding", methods=["GET", "POST"])
+@require_account
+def onboarding(session_data):
+    profile = supabase_profile(
+        session_data["user_id"],
+        session_data["access_token"],
+    )
+    if not profile:
+        return account_page(
+            "Onboarding error",
+            '<h1>Profile unavailable</h1>'
+            '<p class="error">The profile record could not be loaded.</p>',
+        ), 500
 
+    error_message = None
+
+    if request.method == "POST":
+        display_name = request.form.get("display_name", "").strip()
+        timezone_name = request.form.get("timezone", "").strip()
+        units = request.form.get("units", "").strip()
+
+        if not display_name:
+            error_message = "Display name is required."
+        elif len(display_name) > 100:
+            error_message = "Display name must be 100 characters or fewer."
+        elif not timezone_name:
+            error_message = "Time zone is required."
+        elif len(timezone_name) > 100:
+            error_message = "Time zone must be 100 characters or fewer."
+        elif units not in {"imperial", "metric"}:
+            error_message = "Choose imperial or metric units."
+        else:
+            _, error_message = update_supabase_profile(
+                session_data["user_id"],
+                session_data["access_token"],
+                {
+                    "display_name": display_name,
+                    "timezone": timezone_name,
+                    "units": units,
+                    "onboarding_completed": True,
+                },
+            )
+            if not error_message:
+                return redirect("/account?onboarding=saved")
+
+    error_html = (
+        f'<p class="error">{escape(error_message)}</p>'
+        if error_message else ""
+    )
+    display_name = request.form.get(
+        "display_name",
+        profile.get("display_name") or "",
+    )
+    timezone_name = request.form.get(
+        "timezone",
+        profile.get("timezone") or "America/Denver",
+    )
+    units = request.form.get(
+        "units",
+        profile.get("units") or "imperial",
+    )
+
+    imperial_selected = "selected" if units == "imperial" else ""
+    metric_selected = "selected" if units == "metric" else ""
+
+    return account_page(
+        "Profile setup",
+        f"""
+<h1>Profile setup</h1>
+<p>This establishes account-level settings shared by every coaching integration. Goals and coaching preferences come next.</p>
+{error_html}
+<form method="post" action="/onboarding">
+<label for="display_name">Display name</label>
+<input id="display_name" name="display_name" maxlength="100" value="{escape(display_name)}" required>
+<label for="timezone">Time zone</label>
+<input id="timezone" name="timezone" maxlength="100" value="{escape(timezone_name)}" required>
+<p>Use an IANA time-zone name such as <code>America/Denver</code>.</p>
+<label for="units">Measurement units</label>
+<select id="units" name="units" required>
+<option value="imperial" {imperial_selected}>Imperial</option>
+<option value="metric" {metric_selected}>Metric</option>
+</select>
+<button type="submit">Save profile</button>
+</form>
+<p><a href="/account">Return to account</a></p>""",
+    )
+
+
+@app.route("/account")
+@require_account
+def account(session_data):
     profile = supabase_profile(session_data["user_id"], session_data["access_token"])
     if not profile:
         return account_page("Account error", """
 <h1>Account unavailable</h1><p class="error">You are logged in, but the matching profile record could not be loaded.</p>"""), 500
 
+    saved_notice = (
+        '<p class="success">Profile settings saved.</p>'
+        if request.args.get("onboarding") == "saved" else ""
+    )
+    onboarding_label = "Complete" if profile.get("onboarding_completed") else "Ready to begin"
+    onboarding_button = "Edit profile settings" if profile.get("onboarding_completed") else "Begin profile setup"
+
     return account_page("Account", f"""
 <h1>{escape(profile.get("display_name") or profile["username"])}</h1>
 <p class="success">Browser account authentication is working.</p>
+{saved_notice}
 <dl><dt>Display name</dt><dd>{escape(profile.get("display_name") or "")}</dd>
 <dt>Username</dt><dd>{escape(profile.get("username") or "")}</dd>
 <dt>Email</dt><dd>{escape(profile.get("email") or session_data.get("email") or "")}</dd>
 <dt>Time zone</dt><dd>{escape(profile.get("timezone") or "")}</dd>
 <dt>Units</dt><dd>{escape(profile.get("units") or "")}</dd>
-<dt>Onboarding</dt><dd>{"Complete" if profile.get("onboarding_completed") else "Ready to begin"}</dd></dl>
-<p>Your account is working. Coaching preferences and fitness-service connections will be added during onboarding.</p>
+<dt>Onboarding</dt><dd>{onboarding_label}</dd></dl>
+<p><a class="button" href="/onboarding">{onboarding_button}</a></p>
+<p>Goals, coaching preferences, and fitness-service connections will be added in the next onboarding stages.</p>
 <form method="post" action="/logout"><button class="secondary" type="submit">Log out</button></form>""")
 
 
@@ -1266,7 +1394,7 @@ def summary(user_id):
         missing_sources = ["withings"]
 
     summary_data = {
-        "debug_version": "multiuser-step8-setup-session",
+        "debug_version": "multiuser-step10-profile-onboarding",
         "user_id": user_id,
         "period_days": 14,
         "workout_count": workout_count,
