@@ -830,7 +830,7 @@ def onboarding_profile(session_data):
 </div>
 <label>FTP override</label><input type="number" name="ftp_override" value="{escape(str(form_value("ftp_override"))) if form_value("ftp_override") else ""}">
 </fieldset>
-<div class="actions"><button type="submit">Save and continue</button><a href="/account">Return to account</a></div>
+<div class="actions"><button type="submit">Save and continue</button><a href="/account">Return to Account</a></div>
 </form>""")
 
 
@@ -947,7 +947,7 @@ def onboarding_training(session_data):
 <textarea name="bad_weather_strategy" placeholder="Include heat, cold, smoke, rain, snow, darkness, or other conditions. Describe preferred substitutions.">{escape(request.form.get("bad_weather_strategy", training.get("bad_weather_strategy") or ""))}</textarea>
 <fieldset><legend>Equipment and access</legend><div class="check-grid">{equipment_html}</div></fieldset>
 <fieldset><legend>Indoor platforms</legend><div class="check-grid">{platforms_html}</div></fieldset>
-<div class="actions"><button type="submit">Save and continue</button><a href="/onboarding/profile">Back</a></div>
+<div class="actions"><button type="submit">Save and continue</button><a href="/onboarding/profile">Back</a><a href="/account">Return to Account</a></div>
 </form>""")
 
 
@@ -990,7 +990,7 @@ def onboarding_context(session_data):
 <h1>Coaching context</h1>
 <p>These are persistent instructions and circumstances, not goals or backend implementation details.</p>
 {error_html}<form method="post">{boxes}
-<div class="actions"><button type="submit">Save and continue</button><a href="/onboarding/training">Back</a></div>
+<div class="actions"><button type="submit">Save and continue</button><a href="/onboarding/training">Back</a><a href="/account">Return to Account</a></div>
 </form>""")
 
 
@@ -1074,7 +1074,7 @@ def onboarding_goals(session_data):
 <h1>Goals</h1>
 <p>Goals may be directional, ongoing, or numeric. Dates and formal success metrics are not required.</p>
 {error_html}<form method="post">{"".join(cards)}
-<div class="actions"><button type="submit">Save and continue</button><a href="/onboarding/context">Back</a></div>
+<div class="actions"><button type="submit">Save and continue</button><a href="/onboarding/context">Back</a><a href="/account">Return to Account</a></div>
 </form>""")
 
 
@@ -1098,7 +1098,7 @@ def integration_placeholder_page(session_data, current_key, title, explanation):
   have been saved. This connection stage has not been implemented yet.
 </p>
 <div class="actions">
-  <a class="button" href="/account">Return to account</a>
+  <a class="button" href="/account">Return to Account</a>
   <a href="/onboarding/goals">Edit goals</a>
 </div>
 """,
@@ -1121,6 +1121,7 @@ def onboarding_strava(session_data):
 <div class="actions">
   <a class="button" href="/onboarding/withings">Continue to Withings</a>
   <a href="/account/connect/strava">Reconnect Strava</a>
+  <a href="/account">Return to Account</a>
 </div>
 <form method="post" action="/account/disconnect/strava">
   <button class="secondary" type="submit">Disconnect Strava from this account</button>
@@ -1132,7 +1133,7 @@ def onboarding_strava(session_data):
 <p>This connection belongs only to the currently signed-in coaching account.</p>
 <div class="actions">
   <a class="button" href="/account/connect/strava">Connect Strava</a>
-  <a href="/account">Return to account</a>
+  <a href="/account">Return to Account</a>
 </div>
 """
     return account_page("Connect Strava", f"""
@@ -1184,6 +1185,7 @@ def onboarding_withings(session_data):
 <div class="actions">
   <a class="button" href="/onboarding/integrations">Continue</a>
   <a href="/account/connect/withings">Reconnect Withings</a>
+  <a href="/account">Return to Account</a>
 </div>
 <form method="post" action="/account/disconnect/withings">
   <button class="secondary" type="submit">Disconnect Withings from this account</button>
@@ -1196,6 +1198,7 @@ def onboarding_withings(session_data):
 <div class="actions">
   <a class="button" href="/onboarding/integrations">Continue</a>
   <a href="/account/connect/withings">Connect Withings</a>
+  <a href="/account">Return to Account</a>
 </div>
 """
     else:
@@ -1203,6 +1206,7 @@ def onboarding_withings(session_data):
 <p>Withings is optional. Connecting it adds weight and body-composition trends to coaching.</p>
 <div class="actions">
   <a class="button" href="/account/connect/withings">Connect Withings</a>
+  <a href="/account">Return to Account</a>
 </div>
 <form method="post" action="/account/skip/withings">
   <button class="secondary" type="submit">Skip Withings for now</button>
@@ -2078,7 +2082,7 @@ def summary(user_id):
         missing_sources = ["withings"]
 
     summary_data = {
-        "debug_version": "multiuser-step15-11-training-state-machine",
+        "debug_version": "multiuser-step15a-11-training-state-machine",
         "user_id": user_id,
         "period_days": 14,
         "workout_count": workout_count,
