@@ -927,19 +927,27 @@ def onboarding_training(session_data):
 
         if not error_message and not selected_activities:
             error_message = "Choose at least one activity preference."
-        elif not error_message and weekday_error:
+        if not error_message and weekday_error:
             error_message = weekday_error
-        elif not error_message and weekend_error:
+        if not error_message and weekend_error:
             error_message = weekend_error
-        elif not error_message and coaching_style not in {key for key, _ in COACHING_STYLE_OPTIONS}:
+        if (
+            not error_message
+            and coaching_style not in {key for key, _ in COACHING_STYLE_OPTIONS}
+        ):
             error_message = "Choose a coaching style."
-        else:
+
+        if not error_message:
+            activity_labels = dict(ACTIVITY_OPTIONS)
             ranked = sorted(
                 (
-                    (details["priority"], key, label)
-                    for key, label in ACTIVITY_OPTIONS
-                    for details in [activity_preferences[key]]
-                    if details["priority"] > 0
+                    (
+                        details["priority"],
+                        key,
+                        activity_labels.get(key, key),
+                    )
+                    for key, details in activity_preferences.items()
+                    if details.get("priority", 0) > 0
                 ),
                 key=lambda item: item[0],
             )
