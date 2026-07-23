@@ -36,6 +36,25 @@ from withings_client import (
 from datetime import datetime, timezone
 from functools import wraps
 
+from onboarding_support import (
+    ACTIVITY_FREQUENCY_OPTIONS,
+    ACTIVITY_OPTIONS,
+    COACHING_STYLE_OPTIONS,
+    COMMON_TIMEZONES,
+    EQUIPMENT_OPTIONS,
+    GOAL_PRIORITY_OPTIONS,
+    GOAL_STATUS_OPTIONS,
+    MAX_GOALS,
+    ONBOARDING_STEPS,
+    PLATFORM_OPTIONS,
+    context_step_complete,
+    goals_step_complete,
+    onboarding_progress_html,
+    onboarding_state,
+    profile_step_complete,
+    training_step_complete,
+)
+
 from token_store import (
     DEFAULT_USER_ID,
     delete_browser_session,
@@ -44,94 +63,6 @@ from token_store import (
 )
 
 app = Flask(__name__)
-
-
-ONBOARDING_STEPS = [
-    {"key": "profile", "label": "Profile", "path": "/onboarding/profile"},
-    {"key": "training", "label": "Training profile", "path": "/onboarding/training"},
-    {"key": "goals", "label": "Goals", "path": "/onboarding/goals"},
-    {"key": "strava", "label": "Connect Strava", "path": "/onboarding/strava"},
-    {"key": "withings", "label": "Connect Withings", "path": "/onboarding/withings"},
-    {"key": "integrations", "label": "AI integrations", "path": "/onboarding/integrations"},
-]
-
-COMMON_TIMEZONES = [
-    "America/New_York",
-    "America/Chicago",
-    "America/Denver",
-    "America/Phoenix",
-    "America/Los_Angeles",
-    "America/Anchorage",
-    "Pacific/Honolulu",
-    "America/Toronto",
-    "America/Vancouver",
-    "Europe/London",
-    "Europe/Paris",
-    "Asia/Tokyo",
-    "Australia/Sydney",
-]
-
-ACTIVITY_OPTIONS = [
-    ("road_cycling", "Road cycling"),
-    ("gravel_cycling", "Gravel cycling"),
-    ("mountain_biking", "Mountain biking"),
-    ("indoor_cycling", "Indoor cycling"),
-    ("running", "Running"),
-    ("walking", "Walking"),
-    ("strength_training", "Strength training"),
-    ("cross_country_skiing", "Cross-country skiing"),
-    ("other", "Other activity"),
-]
-
-ACTIVITY_FREQUENCY_OPTIONS = [
-    ("never", "Rarely or never"),
-    ("monthly", "A few times per month"),
-    ("weekly", "About weekly"),
-    ("several_weekly", "Several times per week"),
-    ("most_days", "Most days"),
-]
-
-GOAL_TYPE_OPTIONS = [
-    ("performance", "Performance"),
-    ("event", "Event or challenge"),
-    ("consistency", "Training consistency"),
-    ("body_composition", "Body composition"),
-    ("health", "Health or wellbeing"),
-    ("other", "Other"),
-]
-
-GOAL_STATUS_OPTIONS = [
-    ("active", "Active"),
-    ("planned", "Planned"),
-    ("maintenance", "Maintenance"),
-]
-
-MAX_GOALS = 5
-
-COACHING_STYLE_OPTIONS = [
-    ("adaptive", "Adaptive — adjust recommendations to readiness and circumstances"),
-    ("analytical", "Analytical — emphasize data, rationale, and trends"),
-    ("direct", "Direct — concise recommendations with minimal cushioning"),
-    ("encouraging", "Encouraging — supportive framing and reinforcement"),
-]
-
-EQUIPMENT_OPTIONS = [
-    ("smart_trainer", "Smart trainer"),
-    ("power_meter", "Bike power meter"),
-    ("heart_rate_monitor", "Heart-rate monitor"),
-    ("gps_watch", "GPS watch"),
-    ("gym_access", "Gym access"),
-    ("treadmill", "Treadmill"),
-    ("rowing_machine", "Rowing machine"),
-]
-
-PLATFORM_OPTIONS = [
-    ("zwift", "Zwift"),
-    ("trainerroad", "TrainerRoad"),
-    ("wahoo_systm", "Wahoo SYSTM"),
-    ("peloton", "Peloton"),
-    ("rouvy", "Rouvy"),
-]
 
 
 def configured_api_users():
@@ -410,7 +341,10 @@ def supabase_profile(user_id, access_token):
         f"{supabase_url()}/rest/v1/profiles",
         headers=supabase_headers(supabase_publishable_key(), access_token),
         params={
-            "select": "id,username,email,display_name,timezone,units,onboarding_completed,created_at",
+            "select": ("id,username,email,display_name,timezone,units,date_of_birth,"
+                       "biological_sex,height_value,height_source,weather_location,"
+                       "max_hr_override,resting_hr_override,ftp_override,"
+                       "onboarding_completed,created_at"),
             "id": f"eq.{user_id}",
             "limit": "1",
         },
@@ -497,7 +431,20 @@ def coaching_profile(user_id, access_token):
         access_token,
         select=(
             "user_id,primary_focus,activity_preferences,weekday_minutes,weekend_minutes,"
-            "coaching_style,equipment,indoor_platforms,created_at,updated_at"
+            "coaching_style,equipment,indoor_platforms,bad_weather_strategy,"
+            "created_at,updated_at"
+        ),
+    )
+
+
+def coaching_context(user_id, access_token):
+    return supabase_single_row(
+        "coaching_contexts",
+        user_id,
+        access_token,
+        select=(
+            "user_id,coaching_preferences,training_philosophy,"
+            "lifestyle_constraints,additional_context,created_at,updated_at"
         ),
     )
 
@@ -507,7 +454,10 @@ def coaching_goals(user_id, access_token):
         f"{supabase_url()}/rest/v1/coaching_goals",
         headers=supabase_headers(supabase_publishable_key(), access_token),
         params={
-            "select": "id,user_id,priority,title,goal_type,status,target,target_date,notes,created_at,updated_at",
+            "select": (
+                "id,user_id,priority,title,status,priority_level,"
+                "description,created_at,updated_at"
+            ),
             "user_id": f"eq.{user_id}",
             "order": "priority.asc",
         },
@@ -534,85 +484,6 @@ def replace_coaching_goals(access_token, goals):
         app.logger.warning("Supabase goals replacement failed: %s", message)
         return False, message
     return True, None
-
-
-def goals_step_complete(goals):
-    return any(
-        goal.get("title")
-        and goal.get("status") in {"active", "planned", "maintenance"}
-        for goal in (goals or [])
-    )
-
-
-def profile_step_complete(profile):
-    return bool(
-        profile
-        and profile.get("display_name")
-        and profile.get("timezone")
-        and profile.get("units") in {"imperial", "metric"}
-    )
-
-
-def training_step_complete(training):
-    return bool(
-        training
-        and isinstance(training.get("activity_preferences"), dict)
-        and any(
-            (value or {}).get("priority", 0) > 0
-            for value in training.get("activity_preferences", {}).values()
-        )
-        and isinstance(training.get("weekday_minutes"), int)
-        and isinstance(training.get("weekend_minutes"), int)
-        and training.get("coaching_style")
-    )
-
-
-def onboarding_state(profile, training, goals=None):
-    completion = {
-        "profile": profile_step_complete(profile),
-        "training": training_step_complete(training),
-        "goals": goals_step_complete(goals),
-        # Later deployments will replace these placeholders with real checks.
-        "strava": False,
-        "withings": False,
-        "integrations": False,
-    }
-    next_step = next(
-        (step for step in ONBOARDING_STEPS if not completion[step["key"]]),
-        None,
-    )
-    return {
-        "completion": completion,
-        "next_step": next_step,
-        "complete": next_step is None,
-    }
-
-
-def onboarding_progress_html(state, current_key=None):
-    items = []
-    for step in ONBOARDING_STEPS:
-        key = step["key"]
-        if state["completion"].get(key):
-            status = "✓"
-            css_class = "complete"
-        elif key == current_key:
-            status = "→"
-            css_class = "current"
-        else:
-            status = ""
-            css_class = "pending"
-        if key in {"profile", "training", "goals"} or state["completion"].get(key):
-            content = (
-                f'<a href="{escape(step["path"])}">'
-                f'<span>{escape(step["label"])}</span><strong>{status}</strong></a>'
-            )
-        else:
-            content = (
-                f'<div class="wizard-step-disabled">'
-                f'<span>{escape(step["label"])}</span><strong>{status}</strong></div>'
-            )
-        items.append(f'<li class="{css_class}">{content}</li>')
-    return '<ol class="wizard-progress">' + ''.join(items) + '</ol>'
 
 
 def parse_bounded_minutes(value, label):
@@ -689,8 +560,8 @@ def account_page(title, body):
 <title>{escape(title)} · Fitness Coaching</title>
 <style>
 body{{margin:0;background:#f5f7fa;color:#17202a;font-family:system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}}
-main{{width:min(640px,calc(100% - 32px));margin:48px auto;background:white;border:1px solid #dfe4ea;border-radius:14px;padding:28px;box-shadow:0 8px 24px rgba(0,0,0,.06)}}
-h1{{margin-top:0}} label{{display:block;margin:16px 0 6px;font-weight:600}} input,select{{width:100%;box-sizing:border-box;padding:11px;border:1px solid #aab2bd;border-radius:8px;font:inherit}} code{{background:#eef1f4;border-radius:4px;padding:2px 5px}}
+main{{width:min(860px,calc(100% - 32px));margin:48px auto;background:white;border:1px solid #dfe4ea;border-radius:14px;padding:28px;box-shadow:0 8px 24px rgba(0,0,0,.06)}}
+h1{{margin-top:0}} label{{display:block;margin:16px 0 6px;font-weight:600}} input,select,textarea{{width:100%;box-sizing:border-box;padding:11px;border:1px solid #aab2bd;border-radius:8px;font:inherit}} textarea{{min-height:150px;resize:vertical}} code{{background:#eef1f4;border-radius:4px;padding:2px 5px}}
 button,.button{{display:inline-block;margin-top:20px;padding:11px 16px;border:0;border-radius:8px;background:#1f5f99;color:white;font:inherit;font-weight:650;text-decoration:none;cursor:pointer}}
 .secondary{{background:#5d6d7e}} .error{{padding:12px;border-radius:8px;background:#fdecea;color:#922b21}} .success{{padding:12px;border-radius:8px;background:#eafaf1;color:#196f3d}}
 dl{{display:grid;grid-template-columns:150px 1fr;gap:10px 16px}} dt{{font-weight:700}} dd{{margin:0}}
@@ -801,514 +672,417 @@ def account_logout():
 @app.route("/onboarding")
 @require_account
 def onboarding(session_data):
-    profile = supabase_profile(
-        session_data["user_id"],
-        session_data["access_token"],
-    )
-    training = coaching_profile(
-        session_data["user_id"],
-        session_data["access_token"],
-    )
-    goals = coaching_goals(session_data["user_id"], session_data["access_token"])
-    state = onboarding_state(profile, training, goals)
-    destination = state["next_step"]["path"] if state["next_step"] else "/account"
-    return redirect(destination)
+    user_id = session_data["user_id"]
+    token = session_data["access_token"]
+    profile = supabase_profile(user_id, token)
+    training = coaching_profile(user_id, token)
+    context = coaching_context(user_id, token)
+    goals = coaching_goals(user_id, token)
+    state = onboarding_state(profile, training, context, goals)
+    return redirect(state["next_step"]["path"] if state["next_step"] else "/account")
 
 
 @app.route("/onboarding/profile", methods=["GET", "POST"])
 @require_account
 def onboarding_profile(session_data):
-    profile = supabase_profile(
-        session_data["user_id"],
-        session_data["access_token"],
-    )
+    user_id, token = session_data["user_id"], session_data["access_token"]
+    profile = supabase_profile(user_id, token)
     if not profile:
-        return account_page(
-            "Onboarding error",
-            '<h1>Profile unavailable</h1>'
-            '<p class="error">The profile record could not be loaded.</p>',
-        ), 500
+        return account_page("Onboarding error", '<h1>Profile unavailable</h1>'), 500
 
-    training = coaching_profile(
-        session_data["user_id"],
-        session_data["access_token"],
-    )
-    goals = coaching_goals(session_data["user_id"], session_data["access_token"])
-    state = onboarding_state(profile, training, goals)
+    training = coaching_profile(user_id, token)
+    context = coaching_context(user_id, token)
+    goals = coaching_goals(user_id, token)
+    state = onboarding_state(profile, training, context, goals)
     error_message = None
 
     if request.method == "POST":
         display_name = request.form.get("display_name", "").strip()
         timezone_name = request.form.get("timezone", "").strip()
         units = request.form.get("units", "").strip()
+        date_of_birth = request.form.get("date_of_birth", "").strip()
+        biological_sex = request.form.get("biological_sex", "").strip() or None
+        height_value = request.form.get("height_value", "").strip()
+        height_source = request.form.get("height_source", "auto").strip()
+        weather_location = request.form.get("weather_location", "").strip()
+        max_hr_override = request.form.get("max_hr_override", "").strip() or None
+        resting_hr_override = request.form.get("resting_hr_override", "").strip() or None
+        ftp_override = request.form.get("ftp_override", "").strip() or None
 
-        if not display_name:
+        try:
+            height_number = float(height_value)
+            if not 30 <= height_number <= 260:
+                raise ValueError
+        except ValueError:
+            error_message = "Enter a valid height."
+        if not error_message and not display_name:
             error_message = "Display name is required."
-        elif len(display_name) > 100:
-            error_message = "Display name must be 100 characters or fewer."
-        elif timezone_name not in COMMON_TIMEZONES:
+        elif not error_message and timezone_name not in COMMON_TIMEZONES:
             error_message = "Choose a supported time zone."
-        elif units not in {"imperial", "metric"}:
+        elif not error_message and units not in {"imperial", "metric"}:
             error_message = "Choose imperial or metric units."
-        else:
-            _, error_message = update_supabase_profile(
-                session_data["user_id"],
-                session_data["access_token"],
-                {
-                    "display_name": display_name,
-                    "timezone": timezone_name,
-                    "units": units,
-                    "onboarding_completed": False,
-                },
-            )
+        elif not error_message and not date_of_birth:
+            error_message = "Date of birth is required."
+        elif not error_message and biological_sex not in {None, "male", "female", "intersex", "prefer_not"}:
+            error_message = "Choose a valid biological sex option."
+        elif not error_message and height_source not in {"auto", "manual"}:
+            error_message = "Choose a valid height source."
+        elif not error_message and not weather_location:
+            error_message = "Enter a location for weather-aware coaching."
+
+        if not error_message:
+            updates = {
+                "display_name": display_name,
+                "timezone": timezone_name,
+                "units": units,
+                "date_of_birth": date_of_birth,
+                "biological_sex": biological_sex,
+                "height_value": height_number,
+                "height_source": height_source,
+                "weather_location": weather_location,
+                "max_hr_override": int(max_hr_override) if max_hr_override else None,
+                "resting_hr_override": int(resting_hr_override) if resting_hr_override else None,
+                "ftp_override": int(ftp_override) if ftp_override else None,
+                "onboarding_completed": False,
+            }
+            _, error_message = update_supabase_profile(user_id, token, updates)
             if not error_message:
                 return redirect("/onboarding/training")
 
-    error_html = (
-        f'<p class="error">{escape(error_message)}</p>'
-        if error_message else ""
-    )
-    display_name = request.form.get(
-        "display_name",
-        profile.get("display_name") or "",
-    )
-    timezone_name = request.form.get(
-        "timezone",
-        profile.get("timezone") or "America/Denver",
-    )
-    units = request.form.get(
-        "units",
-        profile.get("units") or "imperial",
-    )
+    def form_value(name, fallback=""):
+        return request.form.get(name, profile.get(name) if profile.get(name) is not None else fallback)
 
-    timezone_options = ''.join(
-        f'<option value="{escape(zone)}" '
-        f'{"selected" if zone == timezone_name else ""}>{escape(zone)}</option>'
+    timezone_name = form_value("timezone", "America/Denver")
+    units = form_value("units", "imperial")
+    timezone_options = "".join(
+        f'<option value="{escape(zone)}" {"selected" if zone == timezone_name else ""}>{escape(zone)}</option>'
         for zone in COMMON_TIMEZONES
     )
-    imperial_selected = "selected" if units == "imperial" else ""
-    metric_selected = "selected" if units == "metric" else ""
-
-    return account_page(
-        "Profile setup",
-        f"""
-{onboarding_progress_html(state, "profile")}
-<h1>Profile</h1>
-<p>Set the personal details shared by every coaching integration.</p>
-{error_html}
-<form method="post" action="/onboarding/profile">
-<label for="display_name">Display name</label>
-<input id="display_name" name="display_name" maxlength="100" value="{escape(display_name)}" required>
-<label for="timezone">Time zone</label>
-<select id="timezone" name="timezone" required>{timezone_options}</select>
-<p class="muted">The browser will select its detected time zone when it appears in this list.</p>
-<label for="units">Measurement units</label>
-<select id="units" name="units" required>
-<option value="imperial" {imperial_selected}>Imperial</option>
-<option value="metric" {metric_selected}>Metric</option>
-</select>
-<div class="actions"><button type="submit">Save and continue</button><a href="/account">Return to account</a></div>
-</form>
-<script>
-const detectedZone = Intl.DateTimeFormat().resolvedOptions().timeZone;
-const timeZoneSelect = document.getElementById('timezone');
-if (detectedZone && [...timeZoneSelect.options].some(option => option.value === detectedZone)) {{
-  if (!timeZoneSelect.value) timeZoneSelect.value = detectedZone;
-}}
-</script>""",
+    sex_value = form_value("biological_sex", "")
+    sex_options = [("", "— Optional —"), ("male", "Male"), ("female", "Female"),
+                   ("intersex", "Intersex"), ("prefer_not", "Prefer not to say")]
+    sex_html = "".join(
+        f'<option value="{value}" {"selected" if value == sex_value else ""}>{label}</option>'
+        for value, label in sex_options
     )
+    source_value = form_value("height_source", "auto")
+    error_html = f'<p class="error">{escape(error_message)}</p>' if error_message else ""
+
+    return account_page("Personal profile", f"""
+{onboarding_progress_html(state, "profile")}
+<h1>Personal profile</h1>
+<p>Connected Strava and Withings values are used by default. Manual values below act as explicit overrides.</p>
+{error_html}
+<form method="post">
+<label>Display name</label><input name="display_name" value="{escape(str(form_value("display_name")))}" required>
+<label>Date of birth</label><input type="date" name="date_of_birth" value="{escape(str(form_value("date_of_birth")))}" required>
+<label>Biological sex <span class="muted">(optional; used only where physiologically relevant)</span></label>
+<select name="biological_sex">{sex_html}</select>
+<label>Height</label>
+<div class="form-grid two-column">
+<input type="number" step="0.1" name="height_value" value="{escape(str(form_value("height_value")))}" required>
+<select name="height_source">
+<option value="auto" {"selected" if source_value == "auto" else ""}>Use connected data when available</option>
+<option value="manual" {"selected" if source_value == "manual" else ""}>Always use this manual value</option>
+</select></div>
+<p class="muted">Enter inches for imperial units or centimeters for metric units.</p>
+<label>Location for weather-aware coaching</label>
+<input name="weather_location" value="{escape(str(form_value("weather_location")))}" placeholder="Salt Lake City, Utah, US" required>
+<label>Time zone</label><select name="timezone" required>{timezone_options}</select>
+<label>Measurement units</label><select name="units">
+<option value="imperial" {"selected" if units == "imperial" else ""}>Imperial</option>
+<option value="metric" {"selected" if units == "metric" else ""}>Metric</option>
+</select>
+<fieldset><legend>Optional manual overrides</legend>
+<p class="muted">Leave blank to use Strava, Withings, or calculated values.</p>
+<div class="form-grid two-column">
+<div><label>Maximum heart rate</label><input type="number" name="max_hr_override" value="{escape(str(form_value("max_hr_override"))) if form_value("max_hr_override") else ""}"></div>
+<div><label>Resting heart rate</label><input type="number" name="resting_hr_override" value="{escape(str(form_value("resting_hr_override"))) if form_value("resting_hr_override") else ""}"></div>
+</div>
+<label>FTP override</label><input type="number" name="ftp_override" value="{escape(str(form_value("ftp_override"))) if form_value("ftp_override") else ""}">
+</fieldset>
+<div class="actions"><button type="submit">Save and continue</button><a href="/account">Return to account</a></div>
+</form>""")
 
 
 @app.route("/onboarding/training", methods=["GET", "POST"])
 @require_account
 def onboarding_training(session_data):
-    profile = supabase_profile(
-        session_data["user_id"],
-        session_data["access_token"],
-    )
+    user_id, token = session_data["user_id"], session_data["access_token"]
+    profile = supabase_profile(user_id, token)
     if not profile_step_complete(profile):
         return redirect("/onboarding/profile")
-
-    training = coaching_profile(
-        session_data["user_id"],
-        session_data["access_token"],
-    ) or {}
-    goals = coaching_goals(session_data["user_id"], session_data["access_token"])
-    state = onboarding_state(profile, training, goals)
+    training = coaching_profile(user_id, token) or {}
+    context = coaching_context(user_id, token)
+    goals = coaching_goals(user_id, token)
+    state = onboarding_state(profile, training, context, goals)
     error_message = None
 
-    saved_preferences = training.get("activity_preferences") or {}
-
     if request.method == "POST":
+        weekday_minutes, weekday_error = parse_bounded_minutes(request.form.get("weekday_minutes"), "Weekday duration")
+        weekend_minutes, weekend_error = parse_bounded_minutes(request.form.get("weekend_minutes"), "Weekend duration")
         coaching_style = request.form.get("coaching_style", "").strip()
-        weekday_minutes, weekday_error = parse_bounded_minutes(
-            request.form.get("weekday_minutes"),
-            "Weekday duration",
-        )
-        weekend_minutes, weekend_error = parse_bounded_minutes(
-            request.form.get("weekend_minutes"),
-            "Weekend duration",
-        )
-        equipment = {key: key in request.form for key, _ in EQUIPMENT_OPTIONS}
-        indoor_platforms = [
-            key for key, _ in PLATFORM_OPTIONS if key in request.form
-        ]
-
-        activity_preferences = {}
-        selected_activities = []
+        bad_weather_strategy = request.form.get("bad_weather_strategy", "").strip()
+        activity_preferences, selected = {}, []
         valid_activities = {key for key, _ in ACTIVITY_OPTIONS}
         valid_frequencies = {key for key, _ in ACTIVITY_FREQUENCY_OPTIONS}
-
         for priority in range(1, 6):
             activity = request.form.get(f"activity_{priority}", "").strip()
             frequency = request.form.get(f"frequency_{priority}", "").strip()
-
             if not activity and not frequency:
                 continue
-            if not activity:
-                error_message = f"Choose an activity for priority {priority}."
+            if activity not in valid_activities or frequency not in valid_frequencies:
+                error_message = f"Complete activity priority {priority}."
                 break
-            if activity not in valid_activities:
-                error_message = f"Choose a valid activity for priority {priority}."
+            if activity in selected:
+                error_message = "Each activity may appear only once."
                 break
-            if not frequency:
-                error_message = f"Choose a frequency for priority {priority}."
-                break
-            if frequency not in valid_frequencies:
-                error_message = f"Choose a valid frequency for priority {priority}."
-                break
-            if activity in selected_activities:
-                error_message = "Each activity can appear only once in the priority list."
-                break
-
-            selected_activities.append(activity)
-            activity_preferences[activity] = {
-                "priority": priority,
-                "frequency": frequency,
-            }
-
-        if not error_message and not selected_activities:
-            error_message = "Choose at least one activity preference."
+            selected.append(activity)
+            activity_preferences[activity] = {"priority": priority, "frequency": frequency}
+        if not error_message and not selected:
+            error_message = "Choose at least one activity."
         if not error_message and weekday_error:
             error_message = weekday_error
         if not error_message and weekend_error:
             error_message = weekend_error
-        if (
-            not error_message
-            and coaching_style not in {key for key, _ in COACHING_STYLE_OPTIONS}
-        ):
+        if not error_message and coaching_style not in {k for k, _ in COACHING_STYLE_OPTIONS}:
             error_message = "Choose a coaching style."
+        if not error_message and not bad_weather_strategy:
+            error_message = "Describe what should happen when outdoor conditions are unsuitable."
 
         if not error_message:
-            activity_labels = dict(ACTIVITY_OPTIONS)
-            ranked = sorted(
-                (
-                    (
-                        details["priority"],
-                        key,
-                        activity_labels.get(key, key),
-                    )
-                    for key, details in activity_preferences.items()
-                    if details.get("priority", 0) > 0
-                ),
-                key=lambda item: item[0],
-            )
-            primary_focus = ranked[0][2] if ranked else None
-            _, error_message = upsert_supabase_row(
-                "coaching_profiles",
-                session_data["access_token"],
-                {
-                    "user_id": session_data["user_id"],
-                    "primary_focus": primary_focus,
-                    "activity_preferences": activity_preferences,
-                    "weekday_minutes": weekday_minutes,
-                    "weekend_minutes": weekend_minutes,
-                    "coaching_style": coaching_style,
-                    "equipment": equipment,
-                    "indoor_platforms": indoor_platforms,
-                },
-            )
+            labels = dict(ACTIVITY_OPTIONS)
+            primary_key = min(activity_preferences, key=lambda k: activity_preferences[k]["priority"])
+            _, error_message = upsert_supabase_row("coaching_profiles", token, {
+                "user_id": user_id,
+                "primary_focus": labels[primary_key],
+                "activity_preferences": activity_preferences,
+                "weekday_minutes": weekday_minutes,
+                "weekend_minutes": weekend_minutes,
+                "coaching_style": coaching_style,
+                "equipment": {k: k in request.form for k, _ in EQUIPMENT_OPTIONS},
+                "indoor_platforms": [k for k, _ in PLATFORM_OPTIONS if k in request.form],
+                "bad_weather_strategy": bad_weather_strategy,
+            })
             if not error_message:
-                return redirect("/onboarding/goals")
+                return redirect("/onboarding/context")
 
-    weekday_minutes = request.form.get(
-        "weekday_minutes",
-        str(training.get("weekday_minutes") if training.get("weekday_minutes") is not None else 60),
-    )
-    weekend_minutes = request.form.get(
-        "weekend_minutes",
-        str(training.get("weekend_minutes") if training.get("weekend_minutes") is not None else 120),
-    )
-    coaching_style = request.form.get(
-        "coaching_style",
-        training.get("coaching_style") or "adaptive",
-    )
-    saved_equipment = training.get("equipment") or {}
-    saved_platforms = training.get("indoor_platforms") or []
-
-    style_options = ''.join(
-        f'<option value="{escape(key)}" '
-        f'{"selected" if key == coaching_style else ""}>{escape(label)}</option>'
-        for key, label in COACHING_STYLE_OPTIONS
-    )
-    equipment_html = ''.join(
-        f'<label><input type="checkbox" name="{escape(key)}" '
-        f'{"checked" if (key in request.form if request.method == "POST" else saved_equipment.get(key)) else ""}>'
-        f'<span>{escape(label)}</span></label>'
-        for key, label in EQUIPMENT_OPTIONS
-    )
-    platforms_html = ''.join(
-        f'<label><input type="checkbox" name="{escape(key)}" '
-        f'{"checked" if (key in request.form if request.method == "POST" else key in saved_platforms) else ""}>'
-        f'<span>{escape(label)}</span></label>'
-        for key, label in PLATFORM_OPTIONS
-    )
-
-    saved_ranked_preferences = sorted(
-        (
-            (details.get("priority", 99), key, details.get("frequency", ""))
-            for key, details in saved_preferences.items()
-            if isinstance(details, dict) and details.get("priority")
-        ),
-        key=lambda item: item[0],
-    )
-    saved_by_priority = {
-        priority: (key, frequency)
-        for priority, key, frequency in saved_ranked_preferences
-        if 1 <= int(priority) <= 5
+    saved_preferences = training.get("activity_preferences") or {}
+    by_priority = {
+        int(v.get("priority")): (k, v.get("frequency"))
+        for k, v in saved_preferences.items() if (v or {}).get("priority")
     }
-
-    activity_rows = []
+    rows = []
     for priority in range(1, 6):
-        if request.method == "POST":
-            selected_activity = request.form.get(f"activity_{priority}", "")
-            selected_frequency = request.form.get(f"frequency_{priority}", "")
-        else:
-            selected_activity, selected_frequency = saved_by_priority.get(
-                priority,
-                ("", ""),
-            )
+        saved_activity, saved_frequency = by_priority.get(priority, ("", ""))
+        selected_activity = request.form.get(f"activity_{priority}", saved_activity)
+        selected_frequency = request.form.get(f"frequency_{priority}", saved_frequency)
+        activity_options = '<option value="">— Leave blank —</option>' + "".join(
+            f'<option value="{k}" {"selected" if k == selected_activity else ""}>{escape(label)}</option>'
+            for k, label in ACTIVITY_OPTIONS
+        )
+        frequency_options = '<option value="">— Select frequency —</option>' + "".join(
+            f'<option value="{k}" {"selected" if k == selected_frequency else ""}>{escape(label)}</option>'
+            for k, label in ACTIVITY_FREQUENCY_OPTIONS
+        )
+        rows.append(f'<tr><th>{priority}</th><td><select name="activity_{priority}">{activity_options}</select></td>'
+                    f'<td><select name="frequency_{priority}">{frequency_options}</select></td></tr>')
 
-        activity_options = '<option value="">— Leave blank —</option>' + ''.join(
-            f'<option value="{escape(key)}" '
-            f'{"selected" if key == selected_activity else ""}>{escape(label)}</option>'
-            for key, label in ACTIVITY_OPTIONS
-        )
-        frequency_options = '<option value="">— Select frequency —</option>' + ''.join(
-            f'<option value="{escape(value)}" '
-            f'{"selected" if value == selected_frequency else ""}>{escape(label)}</option>'
-            for value, label in ACTIVITY_FREQUENCY_OPTIONS
-        )
-        activity_rows.append(
-            f'<tr><th scope="row">{priority}</th>'
-            f'<td><select name="activity_{priority}" aria-label="Activity for priority {priority}">{activity_options}</select></td>'
-            f'<td><select name="frequency_{priority}" aria-label="Frequency for priority {priority}">{frequency_options}</select></td></tr>'
-        )
-
+    def checked(key, saved):
+        return "checked" if (key in request.form if request.method == "POST" else saved) else ""
+    equipment_html = "".join(
+        f'<label><input type="checkbox" name="{k}" {checked(k, (training.get("equipment") or {}).get(k))}><span>{escape(label)}</span></label>'
+        for k, label in EQUIPMENT_OPTIONS
+    )
+    platforms_html = "".join(
+        f'<label><input type="checkbox" name="{k}" {checked(k, k in (training.get("indoor_platforms") or []))}><span>{escape(label)}</span></label>'
+        for k, label in PLATFORM_OPTIONS
+    )
+    style_value = request.form.get("coaching_style", training.get("coaching_style") or "adaptive")
+    style_html = "".join(
+        f'<option value="{k}" {"selected" if k == style_value else ""}>{escape(label)}</option>'
+        for k, label in COACHING_STYLE_OPTIONS
+    )
     error_html = f'<p class="error">{escape(error_message)}</p>' if error_message else ""
-
-    return account_page(
-        "Training profile",
-        f"""
+    return account_page("Training profile", f"""
 {onboarding_progress_html(state, "training")}
-<h1>Training profile</h1>
-<p>List activities in the order you want coaching to favor them. Priority 1 is highest. Fill only as many rows as are useful; each selected activity also needs a realistic availability.</p>
-{error_html}
-<form method="post" action="/onboarding/training">
-<fieldset><legend>Activity preferences</legend>
-<div class="table-scroll"><table class="preference-table"><thead><tr><th>Priority</th><th>Activity</th><th>Typical availability</th></tr></thead><tbody>{''.join(activity_rows)}</tbody></table></div>
-</fieldset>
-<label for="weekday_minutes">Typical weekday workout duration</label>
-<input id="weekday_minutes" type="number" name="weekday_minutes" min="0" max="1440" step="5" value="{escape(str(weekday_minutes))}" required>
-<label for="weekend_minutes">Typical weekend workout duration</label>
-<input id="weekend_minutes" type="number" name="weekend_minutes" min="0" max="1440" step="5" value="{escape(str(weekend_minutes))}" required>
-<label for="coaching_style">Default coaching style</label>
-<select id="coaching_style" name="coaching_style" required>{style_options}</select>
+<h1>Training profile</h1>{error_html}
+<form method="post">
+<fieldset><legend>Activity preferences</legend><div class="table-scroll"><table class="preference-table">
+<thead><tr><th>Priority</th><th>Activity</th><th>Typical availability</th></tr></thead>
+<tbody>{"".join(rows)}</tbody></table></div></fieldset>
+<label>Typical weekday workout duration</label><input type="number" name="weekday_minutes" value="{escape(str(request.form.get("weekday_minutes", training.get("weekday_minutes", 60))))}">
+<label>Typical weekend workout duration</label><input type="number" name="weekend_minutes" value="{escape(str(request.form.get("weekend_minutes", training.get("weekend_minutes", 120))))}">
+<label>Default coaching style</label><select name="coaching_style">{style_html}</select>
+<label>When weather is unsuitable for outdoor training</label>
+<textarea name="bad_weather_strategy" placeholder="Include heat, cold, smoke, rain, snow, darkness, or other conditions. Describe preferred substitutions.">{escape(request.form.get("bad_weather_strategy", training.get("bad_weather_strategy") or ""))}</textarea>
 <fieldset><legend>Equipment and access</legend><div class="check-grid">{equipment_html}</div></fieldset>
 <fieldset><legend>Indoor platforms</legend><div class="check-grid">{platforms_html}</div></fieldset>
 <div class="actions"><button type="submit">Save and continue</button><a href="/onboarding/profile">Back</a></div>
-</form>""",
+</form>""")
+
+
+@app.route("/onboarding/context", methods=["GET", "POST"])
+@require_account
+def onboarding_context(session_data):
+    user_id, token = session_data["user_id"], session_data["access_token"]
+    profile = supabase_profile(user_id, token)
+    training = coaching_profile(user_id, token)
+    if not profile_step_complete(profile):
+        return redirect("/onboarding/profile")
+    if not training_step_complete(training):
+        return redirect("/onboarding/training")
+    context = coaching_context(user_id, token) or {}
+    goals = coaching_goals(user_id, token)
+    state = onboarding_state(profile, training, context, goals)
+    error_message = None
+    fields = [
+        ("coaching_preferences", "Coaching preferences", "How the coach should communicate, challenge, or question you."),
+        ("training_philosophy", "Training habits and philosophy", "How different activities usually function in your training."),
+        ("lifestyle_constraints", "Lifestyle and constraints", "Family, work, travel, schedule, injuries, or repeatability constraints."),
+        ("additional_context", "Additional standing context", "Anything else the coach should consistently remember."),
+    ]
+    if request.method == "POST":
+        values = {key: request.form.get(key, "").strip() or None for key, _, _ in fields}
+        if not any(values.values()):
+            error_message = "Enter at least one piece of coaching context."
+        else:
+            _, error_message = upsert_supabase_row("coaching_contexts", token, {"user_id": user_id, **values})
+            if not error_message:
+                return redirect("/onboarding/goals")
+    error_html = f'<p class="error">{escape(error_message)}</p>' if error_message else ""
+    boxes = "".join(
+        f'<label>{escape(label)}</label><p class="muted">{escape(help_text)}</p>'
+        f'<textarea name="{key}" rows="8">{escape(request.form.get(key, context.get(key) or ""))}</textarea>'
+        for key, label, help_text in fields
     )
+    return account_page("Coaching context", f"""
+{onboarding_progress_html(state, "context")}
+<h1>Coaching context</h1>
+<p>These are persistent instructions and circumstances, not goals or backend implementation details.</p>
+{error_html}<form method="post">{boxes}
+<div class="actions"><button type="submit">Save and continue</button><a href="/onboarding/training">Back</a></div>
+</form>""")
 
 
 @app.route("/onboarding/goals", methods=["GET", "POST"])
 @require_account
 def onboarding_goals(session_data):
-    profile = supabase_profile(session_data["user_id"], session_data["access_token"])
-    training = coaching_profile(session_data["user_id"], session_data["access_token"])
+    user_id, token = session_data["user_id"], session_data["access_token"]
+    profile = supabase_profile(user_id, token)
+    training = coaching_profile(user_id, token)
+    context = coaching_context(user_id, token)
     if not profile_step_complete(profile):
         return redirect("/onboarding/profile")
     if not training_step_complete(training):
         return redirect("/onboarding/training")
-
-    existing_goals = coaching_goals(
-        session_data["user_id"],
-        session_data["access_token"],
-    )
+    if not context_step_complete(context):
+        return redirect("/onboarding/context")
+    existing = coaching_goals(user_id, token)
+    state = onboarding_state(profile, training, context, existing)
     error_message = None
 
     if request.method == "POST":
-        submitted_goals = []
-        seen_titles = set()
+        submitted = []
         for priority in range(1, MAX_GOALS + 1):
             title = request.form.get(f"goal_title_{priority}", "").strip()
-            goal_type = request.form.get(f"goal_type_{priority}", "").strip()
             status = request.form.get(f"goal_status_{priority}", "").strip()
-            target = request.form.get(f"goal_target_{priority}", "").strip()
-            target_date = request.form.get(f"goal_date_{priority}", "").strip()
-            notes = request.form.get(f"goal_notes_{priority}", "").strip()
-
+            priority_level = request.form.get(f"goal_priority_{priority}", "").strip()
+            description = request.form.get(f"goal_description_{priority}", "").strip()
             if not title:
-                if any([goal_type, status, target, target_date, notes]):
-                    error_message = f"Goal {priority} needs a title or should be left completely blank."
+                if status or priority_level or description:
+                    error_message = f"Goal {priority} needs a title or must be blank."
                     break
                 continue
-            if len(title) > 160:
-                error_message = f"Goal {priority} title must be 160 characters or fewer."
-                break
-            normalized_title = title.casefold()
-            if normalized_title in seen_titles:
-                error_message = "Each goal title must be unique."
-                break
-            seen_titles.add(normalized_title)
-            if goal_type not in {value for value, _ in GOAL_TYPE_OPTIONS}:
-                error_message = f"Choose a type for goal {priority}."
-                break
-            if status not in {value for value, _ in GOAL_STATUS_OPTIONS}:
+            if status not in {k for k, _ in GOAL_STATUS_OPTIONS}:
                 error_message = f"Choose a status for goal {priority}."
                 break
-            if len(target) > 160:
-                error_message = f"Goal {priority} target must be 160 characters or fewer."
+            if priority_level not in {k for k, _ in GOAL_PRIORITY_OPTIONS}:
+                error_message = f"Choose a priority for goal {priority}."
                 break
-            if len(notes) > 1000:
-                error_message = f"Goal {priority} notes must be 1,000 characters or fewer."
-                break
-
-            submitted_goals.append({
-                "priority": priority,
-                "title": title,
-                "goal_type": goal_type,
-                "status": status,
-                "target": target or None,
-                "target_date": target_date or None,
-                "notes": notes or None,
+            submitted.append({
+                "priority": priority, "title": title, "status": status,
+                "priority_level": priority_level, "description": description or None,
             })
-
-        if not error_message and not submitted_goals:
+        if not error_message and not submitted:
             error_message = "Add at least one goal."
-
         if not error_message:
-            saved, error_message = replace_coaching_goals(
-                session_data["access_token"],
-                submitted_goals,
-            )
+            saved, error_message = replace_coaching_goals(token, submitted)
             if saved:
                 return redirect("/onboarding/strava")
     else:
-        submitted_goals = existing_goals
+        submitted = existing
 
-    goals_by_priority = {
-        int(goal.get("priority") or index): goal
-        for index, goal in enumerate(submitted_goals, start=1)
-    }
-    state = onboarding_state(profile, training, existing_goals)
-    rows = []
+    goals_by_priority = {int(g.get("priority") or i): g for i, g in enumerate(submitted, 1)}
+    cards = []
     for priority in range(1, MAX_GOALS + 1):
         goal = goals_by_priority.get(priority, {})
         title = goal.get("title") or ""
-        selected_type = goal.get("goal_type") or ""
-        selected_status = goal.get("status") or ("active" if priority == 1 else "")
-        target = goal.get("target") or ""
-        target_date = goal.get("target_date") or ""
-        notes = goal.get("notes") or ""
-        type_options = '<option value="">— Select type —</option>' + ''.join(
-            f'<option value="{escape(value)}" {"selected" if value == selected_type else ""}>{escape(label)}</option>'
-            for value, label in GOAL_TYPE_OPTIONS
+        status_value = goal.get("status") or ("active" if priority == 1 else "")
+        level_value = goal.get("priority_level") or ("high" if priority == 1 else "")
+        description = goal.get("description") or ""
+        status_html = '<option value="">— Select —</option>' + "".join(
+            f'<option value="{k}" {"selected" if k == status_value else ""}>{escape(label)}</option>'
+            for k, label in GOAL_STATUS_OPTIONS
         )
-        status_options = '<option value="">— Select status —</option>' + ''.join(
-            f'<option value="{escape(value)}" {"selected" if value == selected_status else ""}>{escape(label)}</option>'
-            for value, label in GOAL_STATUS_OPTIONS
+        level_html = '<option value="">— Select —</option>' + "".join(
+            f'<option value="{k}" {"selected" if k == level_value else ""}>{escape(label)}</option>'
+            for k, label in GOAL_PRIORITY_OPTIONS
         )
-        rows.append(f"""
+        cards.append(f"""
 <fieldset class="goal-card"><legend>Goal {priority}</legend>
-<label for="goal_title_{priority}">Goal</label>
-<input id="goal_title_{priority}" name="goal_title_{priority}" maxlength="160" value="{escape(title)}" placeholder="e.g., Improve sustainable cycling power">
+<label>Goal</label><input name="goal_title_{priority}" value="{escape(title)}" placeholder="e.g., Gradually reach about 165 lb">
 <div class="form-grid two-column">
-<div><label for="goal_type_{priority}">Type</label><select id="goal_type_{priority}" name="goal_type_{priority}">{type_options}</select></div>
-<div><label for="goal_status_{priority}">Status</label><select id="goal_status_{priority}" name="goal_status_{priority}">{status_options}</select></div>
+<div><label>Priority</label><select name="goal_priority_{priority}">{level_html}</select></div>
+<div><label>Status</label><select name="goal_status_{priority}">{status_html}</select></div>
 </div>
-<div class="form-grid two-column">
-<div><label for="goal_target_{priority}">Target or success measure</label><input id="goal_target_{priority}" name="goal_target_{priority}" maxlength="160" value="{escape(target)}" placeholder="e.g., FTP 300 W or train 5 days/week"></div>
-<div><label for="goal_date_{priority}">Target date</label><input id="goal_date_{priority}" type="date" name="goal_date_{priority}" value="{escape(str(target_date))}"></div>
-</div>
-<label for="goal_notes_{priority}">Context or constraints</label>
-<textarea id="goal_notes_{priority}" name="goal_notes_{priority}" maxlength="1000" rows="3" placeholder="Why this matters, tradeoffs, or anything the coach should remember">{escape(notes)}</textarea>
+<label>Description and context</label>
+<textarea name="goal_description_{priority}" rows="8" placeholder="Explain what this goal means, why it matters, and any tradeoffs or constraints.">{escape(description)}</textarea>
 </fieldset>""")
-
     error_html = f'<p class="error">{escape(error_message)}</p>' if error_message else ""
-    return account_page(
-        "Goals",
-        f"""
+    return account_page("Goals", f"""
 {onboarding_progress_html(state, "goals")}
 <h1>Goals</h1>
-<p>Enter goals in priority order. Use as many rows as are useful; blank lower rows are ignored. Targets and dates are optional because some goals are directional rather than numeric.</p>
-{error_html}
-<form method="post" action="/onboarding/goals">
-{''.join(rows)}
-<div class="actions"><button type="submit">Save and continue</button><a href="/onboarding/training">Back</a></div>
-</form>""",
-    )
+<p>Goals may be directional, ongoing, or numeric. Dates and formal success metrics are not required.</p>
+{error_html}<form method="post">{"".join(cards)}
+<div class="actions"><button type="submit">Save and continue</button><a href="/onboarding/context">Back</a></div>
+</form>""")
 
 
 @app.route("/account")
 @require_account
 def account(session_data):
-    profile = supabase_profile(session_data["user_id"], session_data["access_token"])
+    user_id, token = session_data["user_id"], session_data["access_token"]
+    profile = supabase_profile(user_id, token)
     if not profile:
-        return account_page(
-            "Account error",
-            '<h1>Account unavailable</h1>'
-            '<p class="error">You are logged in, but the matching profile record could not be loaded.</p>',
-        ), 500
-
-    training = coaching_profile(
-        session_data["user_id"],
-        session_data["access_token"],
-    )
-    goals = coaching_goals(session_data["user_id"], session_data["access_token"])
-    state = onboarding_state(profile, training, goals)
+        return account_page("Account error", '<h1>Account unavailable</h1>'), 500
+    training = coaching_profile(user_id, token)
+    context = coaching_context(user_id, token)
+    goals = coaching_goals(user_id, token)
+    state = onboarding_state(profile, training, context, goals)
     next_step = state["next_step"]
     next_html = (
         f'<p><strong>Next step:</strong> {escape(next_step["label"])}</p>'
         f'<p><a class="button" href="{escape(next_step["path"])}">Continue onboarding</a></p>'
-        if next_step
-        else '<p class="success">Onboarding complete.</p>'
+        if next_step else '<p class="success">Onboarding complete.</p>'
     )
-    training_summary = "Not configured"
-    if training_step_complete(training):
-        training_summary = (
-            f'{escape(training.get("primary_focus") or "")} · '
-            f'{escape(str(training.get("weekday_minutes")))} min weekdays · '
-            f'{escape(str(training.get("weekend_minutes")))} min weekends'
-        )
-
-    return account_page(
-        "Account",
-        f"""
+    links = " · ".join([
+        '<a href="/onboarding/profile">Edit personal profile</a>',
+        '<a href="/onboarding/training">Edit training profile</a>',
+        '<a href="/onboarding/context">Edit coaching context</a>',
+        '<a href="/onboarding/goals">Edit goals</a>',
+    ])
+    return account_page("Account", f"""
 <h1>{escape(profile.get("display_name") or profile["username"])}</h1>
-<p class="success">Browser account authentication is working.</p>
-<dl><dt>Display name</dt><dd>{escape(profile.get("display_name") or "")}</dd>
-<dt>Username</dt><dd>{escape(profile.get("username") or "")}</dd>
-<dt>Email</dt><dd>{escape(profile.get("email") or session_data.get("email") or "")}</dd>
+<dl>
+<dt>Location</dt><dd>{escape(profile.get("weather_location") or "")}</dd>
 <dt>Time zone</dt><dd>{escape(profile.get("timezone") or "")}</dd>
-<dt>Units</dt><dd>{escape(profile.get("units") or "")}</dd>
-<dt>Training profile</dt><dd>{training_summary}</dd>
-<dt>Goals</dt><dd>{escape(str(len(goals)))} configured</dd>
-<dt>Onboarding</dt><dd>{"Complete" if state["complete"] else "In progress"}</dd></dl>
-{next_html}
-<p><a href="/onboarding/profile">Edit profile</a>{' · <a href="/onboarding/training">Edit training profile</a>' if training else ''}{' · <a href="/onboarding/goals">Edit goals</a>' if goals else ''}</p>
-<form method="post" action="/logout"><button class="secondary" type="submit">Log out</button></form>""",
-    )
+<dt>Training profile</dt><dd>{"Configured" if training_step_complete(training) else "Not configured"}</dd>
+<dt>Coaching context</dt><dd>{"Configured" if context_step_complete(context) else "Not configured"}</dd>
+<dt>Goals</dt><dd>{len(goals)} configured</dd>
+<dt>Onboarding</dt><dd>{"Complete" if state["complete"] else "In progress"}</dd>
+</dl>{next_html}<p>{links}</p>
+<form method="post" action="/logout"><button class="secondary" type="submit">Log out</button></form>""")
 
 
 SETUP_COOKIE_NAME = "fitness_setup_session"
@@ -2061,7 +1835,7 @@ def summary(user_id):
         missing_sources = ["withings"]
 
     summary_data = {
-        "debug_version": "multiuser-step11-training-state-machine",
+        "debug_version": "multiuser-step13-11-training-state-machine",
         "user_id": user_id,
         "period_days": 14,
         "workout_count": workout_count,
