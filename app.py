@@ -22,6 +22,7 @@ from strava_client import (
     get_athlete_zones,
     extract_zone_data,
     exchange_strava_code,
+    strava_connection,
 )
 
 from training_zones import summarize_power_stream_intensity
@@ -58,6 +59,7 @@ from onboarding_support import (
 from token_store import (
     DEFAULT_USER_ID,
     delete_browser_session,
+    delete_service_tokens,
     get_browser_session,
     save_browser_session,
 )
@@ -149,10 +151,11 @@ def oauth_state_secret():
     return secret.encode("utf-8")
 
 
-def create_oauth_state(user_id, service):
+def create_oauth_state(user_id, service, flow="legacy"):
     payload = {
         "user_id": user_id,
         "service": service,
+        "flow": flow,
         "issued_at": int(time.time()),
     }
     payload_bytes = json.dumps(payload, separators=(",", ":")).encode("utf-8")
@@ -165,38 +168,36 @@ def create_oauth_state(user_id, service):
     return f"{encoded_payload}.{signature}"
 
 
-def read_oauth_state(state, expected_service):
+def read_oauth_state_payload(state, expected_service):
     if not state or "." not in state:
         return None
-
     encoded_payload, supplied_signature = state.rsplit(".", 1)
     expected_signature = hmac.new(
         oauth_state_secret(),
         encoded_payload.encode("ascii"),
         hashlib.sha256,
     ).hexdigest()
-
     if not hmac.compare_digest(supplied_signature, expected_signature):
         return None
-
     padded_payload = encoded_payload + "=" * (-len(encoded_payload) % 4)
     try:
         payload = json.loads(base64.urlsafe_b64decode(padded_payload).decode("utf-8"))
     except (ValueError, json.JSONDecodeError):
         return None
-
     if payload.get("service") != expected_service:
         return None
-
     issued_at = payload.get("issued_at", 0)
     if not isinstance(issued_at, int) or time.time() - issued_at > 900:
         return None
-
     user_id = payload.get("user_id")
-    if user_id not in configured_api_users().values():
+    if not isinstance(user_id, str) or not user_id or len(user_id) > 128:
         return None
+    return payload
 
-    return user_id
+
+def read_oauth_state(state, expected_service):
+    payload = read_oauth_state_payload(state, expected_service)
+    return payload.get("user_id") if payload else None
 
 
 # ===========================================================================
@@ -669,6 +670,22 @@ def account_logout():
     return response
 
 
+def account_onboarding_state(user_id, token):
+    profile = supabase_profile(user_id, token)
+    training = coaching_profile(user_id, token)
+    context = coaching_context(user_id, token)
+    goals = coaching_goals(user_id, token)
+    connection = strava_connection(user_id)
+    state = onboarding_state(
+        profile,
+        training,
+        context,
+        goals,
+        integrations={"strava": connection["connected"]},
+    )
+    return profile, training, context, goals, connection, state
+
+
 @app.route("/onboarding")
 @require_account
 def onboarding(session_data):
@@ -1079,12 +1096,61 @@ def integration_placeholder_page(session_data, current_key, title, explanation):
 @app.route("/onboarding/strava")
 @require_account
 def onboarding_strava(session_data):
-    return integration_placeholder_page(
-        session_data,
-        "strava",
-        "Connect Strava",
-        "The next development step will connect Strava to the signed-in account.",
+    user_id, token = session_data["user_id"], session_data["access_token"]
+    profile, training, context, goals, connection, state = account_onboarding_state(user_id, token)
+    if not goals_step_complete(goals):
+        return redirect("/onboarding/goals")
+
+    if connection["connected"]:
+        athlete = connection.get("athlete_name") or "your Strava account"
+        status_html = f"""
+<p class="success"><strong>Connected:</strong> {escape(athlete)}</p>
+<p>Strava activity data can now be retrieved separately for this signed-in account.</p>
+<div class="actions">
+  <a class="button" href="/onboarding/withings">Continue to Withings</a>
+  <a href="/account/connect/strava">Reconnect Strava</a>
+</div>
+<form method="post" action="/account/disconnect/strava">
+  <button class="secondary" type="submit">Disconnect Strava from this account</button>
+</form>
+"""
+    else:
+        status_html = """
+<p>Connect Strava to import activities, heart-rate zones, power zones, and other training data.</p>
+<p>This connection belongs only to the currently signed-in coaching account.</p>
+<div class="actions">
+  <a class="button" href="/account/connect/strava">Connect Strava</a>
+  <a href="/account">Return to account</a>
+</div>
+"""
+    return account_page("Connect Strava", f"""
+{onboarding_progress_html(state, "strava")}
+<h1>Connect Strava</h1>
+{status_html}
+""")
+
+
+@app.route("/account/connect/strava")
+@require_account
+def account_connect_strava(session_data):
+    state = create_oauth_state(session_data["user_id"], "strava", flow="account")
+    auth_url = (
+        "https://www.strava.com/oauth/authorize"
+        f"?client_id={CLIENT_ID}"
+        "&response_type=code"
+        f"&redirect_uri={REDIRECT_URI}"
+        "&approval_prompt=force"
+        "&scope=read,activity:read_all,profile:read_all"
+        f"&state={state}"
     )
+    return redirect(auth_url)
+
+
+@app.route("/account/disconnect/strava", methods=["POST"])
+@require_account
+def account_disconnect_strava(session_data):
+    delete_service_tokens("strava", session_data["user_id"])
+    return redirect("/onboarding/strava")
 
 
 @app.route("/onboarding/withings")
@@ -1113,13 +1179,9 @@ def onboarding_integrations(session_data):
 @require_account
 def account(session_data):
     user_id, token = session_data["user_id"], session_data["access_token"]
-    profile = supabase_profile(user_id, token)
+    profile, training, context, goals, strava_status, state = account_onboarding_state(user_id, token)
     if not profile:
         return account_page("Account error", '<h1>Account unavailable</h1>'), 500
-    training = coaching_profile(user_id, token)
-    context = coaching_context(user_id, token)
-    goals = coaching_goals(user_id, token)
-    state = onboarding_state(profile, training, context, goals)
     next_step = state["next_step"]
     next_html = (
         f'<p><strong>Next step:</strong> {escape(next_step["label"])}</p>'
@@ -1131,6 +1193,7 @@ def account(session_data):
         '<a href="/onboarding/training">Edit training profile</a>',
         '<a href="/onboarding/context">Edit coaching context</a>',
         '<a href="/onboarding/goals">Edit goals</a>',
+        '<a href="/onboarding/strava">Strava connection</a>',
     ])
     return account_page("Account", f"""
 <h1>{escape(profile.get("display_name") or profile["username"])}</h1>
@@ -1140,6 +1203,7 @@ def account(session_data):
 <dt>Training profile</dt><dd>{"Configured" if training_step_complete(training) else "Not configured"}</dd>
 <dt>Coaching context</dt><dd>{"Configured" if context_step_complete(context) else "Not configured"}</dd>
 <dt>Goals</dt><dd>{len(goals)} configured</dd>
+<dt>Strava</dt><dd>{"Connected" if strava_status["connected"] else "Not connected"}</dd>
 <dt>Onboarding</dt><dd>{"Complete" if state["complete"] else "In progress"}</dd>
 </dl>{next_html}<p>{links}</p>
 <form method="post" action="/logout"><button class="secondary" type="submit">Log out</button></form>""")
@@ -1292,33 +1356,39 @@ def connect_strava():
 @app.route("/exchange_token")
 def exchange_token():
     code = request.args.get("code")
-    error = request.args.get("error")
-    user_id = read_oauth_state(request.args.get("state"), "strava")
+    authorization_error = request.args.get("error")
+    payload = read_oauth_state_payload(request.args.get("state"), "strava")
 
-    if not user_id:
+    if not payload:
         return "Invalid or expired OAuth state", 400
 
-    if error:
-        return f"Authorization failed: {error}", 400
+    user_id = payload["user_id"]
+    flow = payload.get("flow", "legacy")
+
+    if authorization_error:
+        if flow == "account":
+            return redirect("/onboarding/strava?error=authorization_denied")
+        return f"Authorization failed: {authorization_error}", 400
 
     if not code:
         return "Missing authorization code", 400
 
-    token_data, error = exchange_strava_code(code, user_id=user_id)
-
-    if error:
-        message, status = error
+    token_data, exchange_error = exchange_strava_code(code, user_id=user_id)
+    if exchange_error:
+        message, status = exchange_error
         return f"Token exchange failed: {message}", status
+
+    if flow == "account":
+        current_session = read_account_session()
+        if not current_session or current_session.get("user_id") != user_id:
+            return redirect("/login")
+        return redirect("/onboarding/strava?connected=1")
 
     athlete = token_data.get("athlete", {})
     athlete_name = " ".join(
         part for part in [athlete.get("firstname"), athlete.get("lastname")] if part
     ) or "the selected account"
-
-    return setup_dashboard(
-        user_id,
-        f"Strava connected successfully for {athlete_name}.",
-    )
+    return setup_dashboard(user_id, f"Strava connected successfully for {athlete_name}.")
 
 
 @app.route("/activity/<int:activity_id>")
@@ -1895,7 +1965,7 @@ def summary(user_id):
         missing_sources = ["withings"]
 
     summary_data = {
-        "debug_version": "multiuser-step13-11-training-state-machine",
+        "debug_version": "multiuser-step14-11-training-state-machine",
         "user_id": user_id,
         "period_days": 14,
         "workout_count": workout_count,

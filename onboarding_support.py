@@ -113,15 +113,16 @@ def goals_step_complete(goals):
         for goal in (goals or [])
     )
 
-def onboarding_state(profile, training, context=None, goals=None):
+def onboarding_state(profile, training, context=None, goals=None, integrations=None):
+    integrations = integrations or {}
     completion = {
         "profile": profile_step_complete(profile),
         "training": training_step_complete(training),
         "context": context_step_complete(context),
         "goals": goals_step_complete(goals),
-        "strava": False,
-        "withings": False,
-        "integrations": False,
+        "strava": bool(integrations.get("strava")),
+        "withings": bool(integrations.get("withings")),
+        "integrations": bool(integrations.get("ai")),
     }
     next_step = next(
         (step for step in ONBOARDING_STEPS if not completion[step["key"]]),
