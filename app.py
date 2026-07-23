@@ -442,7 +442,7 @@ def register():
         return registration_form(error), 400
     if not auth_payload.get("access_token"):
         return account_page("Check your email", """
-<h1>Check your email</h1><p class="success">Your account was created. Follow the confirmation link from Supabase, then return here to log in.</p>
+<h1>Check your email</h1><p class="success">Your account was created. Supabase will send the confirmation message on behalf of Fitness Coaching, so the sender may appear as Supabase. Follow that link, then return here to log in.</p>
 <p><a class="button" href="/login">Go to login</a></p>""")
 
     session_id = create_account_session(auth_payload)
@@ -506,12 +506,13 @@ def account():
     return account_page("Account", f"""
 <h1>{escape(profile.get("display_name") or profile["username"])}</h1>
 <p class="success">Browser account authentication is working.</p>
-<dl><dt>Username</dt><dd>{escape(profile.get("username") or "")}</dd>
+<dl><dt>Display name</dt><dd>{escape(profile.get("display_name") or "")}</dd>
+<dt>Username</dt><dd>{escape(profile.get("username") or "")}</dd>
 <dt>Email</dt><dd>{escape(profile.get("email") or session_data.get("email") or "")}</dd>
 <dt>Time zone</dt><dd>{escape(profile.get("timezone") or "")}</dd>
 <dt>Units</dt><dd>{escape(profile.get("units") or "")}</dd>
-<dt>Onboarding</dt><dd>{"Complete" if profile.get("onboarding_completed") else "Not yet complete"}</dd></dl>
-<p>Fitness-service connections will be attached to this account in the next step.</p>
+<dt>Onboarding</dt><dd>{"Complete" if profile.get("onboarding_completed") else "Ready to begin"}</dd></dl>
+<p>Your account is working. Coaching preferences and fitness-service connections will be added during onboarding.</p>
 <form method="post" action="/logout"><button class="secondary" type="submit">Log out</button></form>""")
 
 
