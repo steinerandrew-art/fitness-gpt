@@ -91,6 +91,23 @@ ACTIVITY_FREQUENCY_OPTIONS = [
     ("most_days", "Most days"),
 ]
 
+GOAL_TYPE_OPTIONS = [
+    ("performance", "Performance"),
+    ("event", "Event or challenge"),
+    ("consistency", "Training consistency"),
+    ("body_composition", "Body composition"),
+    ("health", "Health or wellbeing"),
+    ("other", "Other"),
+]
+
+GOAL_STATUS_OPTIONS = [
+    ("active", "Active"),
+    ("planned", "Planned"),
+    ("maintenance", "Maintenance"),
+]
+
+MAX_GOALS = 5
+
 COACHING_STYLE_OPTIONS = [
     ("adaptive", "Adaptive — adjust recommendations to readiness and circumstances"),
     ("analytical", "Analytical — emphasize data, rationale, and trends"),
@@ -485,6 +502,48 @@ def coaching_profile(user_id, access_token):
     )
 
 
+def coaching_goals(user_id, access_token):
+    response = requests.get(
+        f"{supabase_url()}/rest/v1/coaching_goals",
+        headers=supabase_headers(supabase_publishable_key(), access_token),
+        params={
+            "select": "id,user_id,priority,title,goal_type,status,target,target_date,notes,created_at,updated_at",
+            "user_id": f"eq.{user_id}",
+            "order": "priority.asc",
+        },
+        timeout=15,
+    )
+    if response.status_code != 200:
+        app.logger.warning(
+            "Supabase coaching goals lookup failed: %s",
+            supabase_error_message(response, "unknown error"),
+        )
+        return []
+    return response.json()
+
+
+def replace_coaching_goals(access_token, goals):
+    response = requests.post(
+        f"{supabase_url()}/rest/v1/rpc/replace_my_coaching_goals",
+        headers=supabase_headers(supabase_publishable_key(), access_token),
+        json={"p_goals": goals},
+        timeout=15,
+    )
+    if response.status_code not in {200, 204}:
+        message = supabase_error_message(response, "The goals could not be saved.")
+        app.logger.warning("Supabase goals replacement failed: %s", message)
+        return False, message
+    return True, None
+
+
+def goals_step_complete(goals):
+    return any(
+        goal.get("title")
+        and goal.get("status") in {"active", "planned", "maintenance"}
+        for goal in (goals or [])
+    )
+
+
 def profile_step_complete(profile):
     return bool(
         profile
@@ -508,12 +567,12 @@ def training_step_complete(training):
     )
 
 
-def onboarding_state(profile, training):
+def onboarding_state(profile, training, goals=None):
     completion = {
         "profile": profile_step_complete(profile),
         "training": training_step_complete(training),
+        "goals": goals_step_complete(goals),
         # Later deployments will replace these placeholders with real checks.
-        "goals": False,
         "strava": False,
         "withings": False,
         "integrations": False,
@@ -750,7 +809,8 @@ def onboarding(session_data):
         session_data["user_id"],
         session_data["access_token"],
     )
-    state = onboarding_state(profile, training)
+    goals = coaching_goals(session_data["user_id"], session_data["access_token"])
+    state = onboarding_state(profile, training, goals)
     destination = state["next_step"]["path"] if state["next_step"] else "/account"
     return redirect(destination)
 
@@ -773,7 +833,8 @@ def onboarding_profile(session_data):
         session_data["user_id"],
         session_data["access_token"],
     )
-    state = onboarding_state(profile, training)
+    goals = coaching_goals(session_data["user_id"], session_data["access_token"])
+    state = onboarding_state(profile, training, goals)
     error_message = None
 
     if request.method == "POST":
@@ -872,7 +933,8 @@ def onboarding_training(session_data):
         session_data["user_id"],
         session_data["access_token"],
     ) or {}
-    state = onboarding_state(profile, training)
+    goals = coaching_goals(session_data["user_id"], session_data["access_token"])
+    state = onboarding_state(profile, training, goals)
     error_message = None
 
     saved_preferences = training.get("activity_preferences") or {}
@@ -1069,7 +1131,7 @@ def onboarding_training(session_data):
     )
 
 
-@app.route("/onboarding/goals")
+@app.route("/onboarding/goals", methods=["GET", "POST"])
 @require_account
 def onboarding_goals(session_data):
     profile = supabase_profile(session_data["user_id"], session_data["access_token"])
@@ -1078,15 +1140,123 @@ def onboarding_goals(session_data):
         return redirect("/onboarding/profile")
     if not training_step_complete(training):
         return redirect("/onboarding/training")
-    state = onboarding_state(profile, training)
+
+    existing_goals = coaching_goals(
+        session_data["user_id"],
+        session_data["access_token"],
+    )
+    error_message = None
+
+    if request.method == "POST":
+        submitted_goals = []
+        seen_titles = set()
+        for priority in range(1, MAX_GOALS + 1):
+            title = request.form.get(f"goal_title_{priority}", "").strip()
+            goal_type = request.form.get(f"goal_type_{priority}", "").strip()
+            status = request.form.get(f"goal_status_{priority}", "").strip()
+            target = request.form.get(f"goal_target_{priority}", "").strip()
+            target_date = request.form.get(f"goal_date_{priority}", "").strip()
+            notes = request.form.get(f"goal_notes_{priority}", "").strip()
+
+            if not title:
+                if any([goal_type, status, target, target_date, notes]):
+                    error_message = f"Goal {priority} needs a title or should be left completely blank."
+                    break
+                continue
+            if len(title) > 160:
+                error_message = f"Goal {priority} title must be 160 characters or fewer."
+                break
+            normalized_title = title.casefold()
+            if normalized_title in seen_titles:
+                error_message = "Each goal title must be unique."
+                break
+            seen_titles.add(normalized_title)
+            if goal_type not in {value for value, _ in GOAL_TYPE_OPTIONS}:
+                error_message = f"Choose a type for goal {priority}."
+                break
+            if status not in {value for value, _ in GOAL_STATUS_OPTIONS}:
+                error_message = f"Choose a status for goal {priority}."
+                break
+            if len(target) > 160:
+                error_message = f"Goal {priority} target must be 160 characters or fewer."
+                break
+            if len(notes) > 1000:
+                error_message = f"Goal {priority} notes must be 1,000 characters or fewer."
+                break
+
+            submitted_goals.append({
+                "priority": priority,
+                "title": title,
+                "goal_type": goal_type,
+                "status": status,
+                "target": target or None,
+                "target_date": target_date or None,
+                "notes": notes or None,
+            })
+
+        if not error_message and not submitted_goals:
+            error_message = "Add at least one goal."
+
+        if not error_message:
+            saved, error_message = replace_coaching_goals(
+                session_data["access_token"],
+                submitted_goals,
+            )
+            if saved:
+                return redirect("/onboarding/strava")
+    else:
+        submitted_goals = existing_goals
+
+    goals_by_priority = {
+        int(goal.get("priority") or index): goal
+        for index, goal in enumerate(submitted_goals, start=1)
+    }
+    state = onboarding_state(profile, training, existing_goals)
+    rows = []
+    for priority in range(1, MAX_GOALS + 1):
+        goal = goals_by_priority.get(priority, {})
+        title = goal.get("title") or ""
+        selected_type = goal.get("goal_type") or ""
+        selected_status = goal.get("status") or ("active" if priority == 1 else "")
+        target = goal.get("target") or ""
+        target_date = goal.get("target_date") or ""
+        notes = goal.get("notes") or ""
+        type_options = '<option value="">— Select type —</option>' + ''.join(
+            f'<option value="{escape(value)}" {"selected" if value == selected_type else ""}>{escape(label)}</option>'
+            for value, label in GOAL_TYPE_OPTIONS
+        )
+        status_options = '<option value="">— Select status —</option>' + ''.join(
+            f'<option value="{escape(value)}" {"selected" if value == selected_status else ""}>{escape(label)}</option>'
+            for value, label in GOAL_STATUS_OPTIONS
+        )
+        rows.append(f"""
+<fieldset class="goal-card"><legend>Goal {priority}</legend>
+<label for="goal_title_{priority}">Goal</label>
+<input id="goal_title_{priority}" name="goal_title_{priority}" maxlength="160" value="{escape(title)}" placeholder="e.g., Improve sustainable cycling power">
+<div class="form-grid two-column">
+<div><label for="goal_type_{priority}">Type</label><select id="goal_type_{priority}" name="goal_type_{priority}">{type_options}</select></div>
+<div><label for="goal_status_{priority}">Status</label><select id="goal_status_{priority}" name="goal_status_{priority}">{status_options}</select></div>
+</div>
+<div class="form-grid two-column">
+<div><label for="goal_target_{priority}">Target or success measure</label><input id="goal_target_{priority}" name="goal_target_{priority}" maxlength="160" value="{escape(target)}" placeholder="e.g., FTP 300 W or train 5 days/week"></div>
+<div><label for="goal_date_{priority}">Target date</label><input id="goal_date_{priority}" type="date" name="goal_date_{priority}" value="{escape(str(target_date))}"></div>
+</div>
+<label for="goal_notes_{priority}">Context or constraints</label>
+<textarea id="goal_notes_{priority}" name="goal_notes_{priority}" maxlength="1000" rows="3" placeholder="Why this matters, tradeoffs, or anything the coach should remember">{escape(notes)}</textarea>
+</fieldset>""")
+
+    error_html = f'<p class="error">{escape(error_message)}</p>' if error_message else ""
     return account_page(
-        "Goals coming next",
+        "Goals",
         f"""
 {onboarding_progress_html(state, "goals")}
 <h1>Goals</h1>
-<p class="success">Your profile and training defaults are saved.</p>
-<p>The goals data model and editing interface are the next onboarding stage. Goals remain incomplete until that stage is deployed.</p>
-<div class="actions"><a class="button" href="/account">Return to account</a><a href="/onboarding/training">Edit training profile</a></div>""",
+<p>Enter goals in priority order. Use as many rows as are useful; blank lower rows are ignored. Targets and dates are optional because some goals are directional rather than numeric.</p>
+{error_html}
+<form method="post" action="/onboarding/goals">
+{''.join(rows)}
+<div class="actions"><button type="submit">Save and continue</button><a href="/onboarding/training">Back</a></div>
+</form>""",
     )
 
 
@@ -1105,7 +1275,8 @@ def account(session_data):
         session_data["user_id"],
         session_data["access_token"],
     )
-    state = onboarding_state(profile, training)
+    goals = coaching_goals(session_data["user_id"], session_data["access_token"])
+    state = onboarding_state(profile, training, goals)
     next_step = state["next_step"]
     next_html = (
         f'<p><strong>Next step:</strong> {escape(next_step["label"])}</p>'
@@ -1132,9 +1303,10 @@ def account(session_data):
 <dt>Time zone</dt><dd>{escape(profile.get("timezone") or "")}</dd>
 <dt>Units</dt><dd>{escape(profile.get("units") or "")}</dd>
 <dt>Training profile</dt><dd>{training_summary}</dd>
+<dt>Goals</dt><dd>{escape(str(len(goals)))} configured</dd>
 <dt>Onboarding</dt><dd>{"Complete" if state["complete"] else "In progress"}</dd></dl>
 {next_html}
-<p><a href="/onboarding/profile">Edit profile</a>{' · <a href="/onboarding/training">Edit training profile</a>' if training else ''}</p>
+<p><a href="/onboarding/profile">Edit profile</a>{' · <a href="/onboarding/training">Edit training profile</a>' if training else ''}{' · <a href="/onboarding/goals">Edit goals</a>' if goals else ''}</p>
 <form method="post" action="/logout"><button class="secondary" type="submit">Log out</button></form>""",
     )
 
