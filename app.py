@@ -71,15 +71,24 @@ COMMON_TIMEZONES = [
     "Australia/Sydney",
 ]
 
-PRIMARY_FOCUS_OPTIONS = [
-    "Road cycling",
-    "Gravel cycling",
-    "Mountain biking",
-    "Indoor cycling",
-    "Running",
-    "Triathlon",
-    "General fitness",
-    "Multi-sport",
+ACTIVITY_OPTIONS = [
+    ("road_cycling", "Road cycling"),
+    ("gravel_cycling", "Gravel cycling"),
+    ("mountain_biking", "Mountain biking"),
+    ("indoor_cycling", "Indoor cycling"),
+    ("running", "Running"),
+    ("walking", "Walking"),
+    ("strength_training", "Strength training"),
+    ("cross_country_skiing", "Cross-country skiing"),
+    ("other", "Other activity"),
+]
+
+ACTIVITY_FREQUENCY_OPTIONS = [
+    ("never", "Rarely or never"),
+    ("monthly", "A few times per month"),
+    ("weekly", "About weekly"),
+    ("several_weekly", "Several times per week"),
+    ("most_days", "Most days"),
 ]
 
 COACHING_STYLE_OPTIONS = [
@@ -470,7 +479,7 @@ def coaching_profile(user_id, access_token):
         user_id,
         access_token,
         select=(
-            "user_id,primary_focus,weekday_minutes,weekend_minutes,"
+            "user_id,primary_focus,activity_preferences,weekday_minutes,weekend_minutes,"
             "coaching_style,equipment,indoor_platforms,created_at,updated_at"
         ),
     )
@@ -488,7 +497,11 @@ def profile_step_complete(profile):
 def training_step_complete(training):
     return bool(
         training
-        and training.get("primary_focus")
+        and isinstance(training.get("activity_preferences"), dict)
+        and any(
+            (value or {}).get("priority", 0) > 0
+            for value in training.get("activity_preferences", {}).values()
+        )
         and isinstance(training.get("weekday_minutes"), int)
         and isinstance(training.get("weekend_minutes"), int)
         and training.get("coaching_style")
@@ -529,10 +542,17 @@ def onboarding_progress_html(state, current_key=None):
         else:
             status = ""
             css_class = "pending"
-        items.append(
-            f'<li class="{css_class}"><span>{escape(step["label"])}</span>'
-            f'<strong>{status}</strong></li>'
-        )
+        if key in {"profile", "training", "goals"} or state["completion"].get(key):
+            content = (
+                f'<a href="{escape(step["path"])}">'
+                f'<span>{escape(step["label"])}</span><strong>{status}</strong></a>'
+            )
+        else:
+            content = (
+                f'<div class="wizard-step-disabled">'
+                f'<span>{escape(step["label"])}</span><strong>{status}</strong></div>'
+            )
+        items.append(f'<li class="{css_class}">{content}</li>')
     return '<ol class="wizard-progress">' + ''.join(items) + '</ol>'
 
 
@@ -854,8 +874,9 @@ def onboarding_training(session_data):
     state = onboarding_state(profile, training)
     error_message = None
 
+    saved_preferences = training.get("activity_preferences") or {}
+
     if request.method == "POST":
-        primary_focus = request.form.get("primary_focus", "").strip()
         coaching_style = request.form.get("coaching_style", "").strip()
         weekday_minutes, weekday_error = parse_bounded_minutes(
             request.form.get("weekday_minutes"),
@@ -865,29 +886,62 @@ def onboarding_training(session_data):
             request.form.get("weekend_minutes"),
             "Weekend duration",
         )
-        equipment = {
-            key: key in request.form
-            for key, _ in EQUIPMENT_OPTIONS
-        }
+        equipment = {key: key in request.form for key, _ in EQUIPMENT_OPTIONS}
         indoor_platforms = [
             key for key, _ in PLATFORM_OPTIONS if key in request.form
         ]
 
-        if primary_focus not in PRIMARY_FOCUS_OPTIONS:
-            error_message = "Choose a primary training focus."
-        elif weekday_error:
+        activity_preferences = {}
+        priority_values = []
+        valid_frequencies = {key for key, _ in ACTIVITY_FREQUENCY_OPTIONS}
+        for key, label in ACTIVITY_OPTIONS:
+            raw_priority = request.form.get(f"priority_{key}", "0")
+            frequency = request.form.get(f"frequency_{key}", "never")
+            try:
+                priority = int(raw_priority)
+            except ValueError:
+                priority = -1
+            if not 0 <= priority <= 5:
+                error_message = f"Priority for {label} must be between 0 and 5."
+                break
+            if frequency not in valid_frequencies:
+                error_message = f"Choose a valid frequency for {label}."
+                break
+            activity_preferences[key] = {
+                "priority": priority,
+                "frequency": frequency,
+            }
+            if priority > 0:
+                priority_values.append(priority)
+
+        if not error_message and not priority_values:
+            error_message = "Give at least one activity a priority from 1 to 5."
+        elif not error_message and len(priority_values) != len(set(priority_values)):
+            error_message = "Use each non-zero priority only once so the ranking is unambiguous."
+        elif not error_message and weekday_error:
             error_message = weekday_error
-        elif weekend_error:
+        elif not error_message and weekend_error:
             error_message = weekend_error
-        elif coaching_style not in {key for key, _ in COACHING_STYLE_OPTIONS}:
+        elif not error_message and coaching_style not in {key for key, _ in COACHING_STYLE_OPTIONS}:
             error_message = "Choose a coaching style."
         else:
+            ranked = sorted(
+                (
+                    (details["priority"], key, label)
+                    for key, label in ACTIVITY_OPTIONS
+                    for details in [activity_preferences[key]]
+                    if details["priority"] > 0
+                ),
+                key=lambda item: item[0],
+            )
+            primary_focus = ranked[0][2] if ranked else None
             _, error_message = upsert_supabase_row(
                 "coaching_profiles",
                 session_data["access_token"],
                 {
                     "user_id": session_data["user_id"],
                     "primary_focus": primary_focus,
+                    "activity_preferences": activity_preferences,
                     "weekday_minutes": weekday_minutes,
                     "weekend_minutes": weekend_minutes,
                     "coaching_style": coaching_style,
@@ -898,10 +952,6 @@ def onboarding_training(session_data):
             if not error_message:
                 return redirect("/onboarding/goals")
 
-    primary_focus = request.form.get(
-        "primary_focus",
-        training.get("primary_focus") or "",
-    )
     weekday_minutes = request.form.get(
         "weekday_minutes",
         str(training.get("weekday_minutes") if training.get("weekday_minutes") is not None else 60),
@@ -917,11 +967,6 @@ def onboarding_training(session_data):
     saved_equipment = training.get("equipment") or {}
     saved_platforms = training.get("indoor_platforms") or []
 
-    focus_options = '<option value="">Choose one</option>' + ''.join(
-        f'<option value="{escape(option)}" '
-        f'{"selected" if option == primary_focus else ""}>{escape(option)}</option>'
-        for option in PRIMARY_FOCUS_OPTIONS
-    )
     style_options = ''.join(
         f'<option value="{escape(key)}" '
         f'{"selected" if key == coaching_style else ""}>{escape(label)}</option>'
@@ -939,21 +984,48 @@ def onboarding_training(session_data):
         f'<span>{escape(label)}</span></label>'
         for key, label in PLATFORM_OPTIONS
     )
-    error_html = (
-        f'<p class="error">{escape(error_message)}</p>'
-        if error_message else ""
-    )
+
+    frequency_options_by_activity = {}
+    activity_rows = []
+    for key, label in ACTIVITY_OPTIONS:
+        saved = saved_preferences.get(key) or {}
+        priority = request.form.get(
+            f"priority_{key}",
+            str(saved.get("priority", 0)),
+        )
+        frequency = request.form.get(
+            f"frequency_{key}",
+            saved.get("frequency", "never"),
+        )
+        priority_options = ''.join(
+            f'<option value="{value}" {"selected" if str(value) == str(priority) else ""}>'
+            f'{"Not ranked" if value == 0 else value}</option>'
+            for value in range(0, 6)
+        )
+        frequency_options = ''.join(
+            f'<option value="{escape(value)}" {"selected" if value == frequency else ""}>'
+            f'{escape(text)}</option>'
+            for value, text in ACTIVITY_FREQUENCY_OPTIONS
+        )
+        activity_rows.append(
+            f'<div class="activity-row-label">{escape(label)}</div>'
+            f'<select name="priority_{escape(key)}" aria-label="Priority for {escape(label)}">{priority_options}</select>'
+            f'<select name="frequency_{escape(key)}" aria-label="Frequency for {escape(label)}">{frequency_options}</select>'
+        )
+
+    error_html = f'<p class="error">{escape(error_message)}</p>' if error_message else ""
 
     return account_page(
         "Training profile",
         f"""
 {onboarding_progress_html(state, "training")}
 <h1>Training profile</h1>
-<p>Describe how you normally train. These are durable defaults, not this week's schedule.</p>
+<p>Rank the activities you most want coaching to favor, and separately describe how often each is realistically available. Priority 1 is highest; leave activities unranked when they should rarely drive recommendations.</p>
 {error_html}
 <form method="post" action="/onboarding/training">
-<label for="primary_focus">Primary focus</label>
-<select id="primary_focus" name="primary_focus" required>{focus_options}</select>
+<fieldset><legend>Activity preferences</legend>
+<div class="activity-grid"><div class="heading">Activity</div><div class="heading">Priority</div><div class="heading">Typical availability</div>{''.join(activity_rows)}</div>
+</fieldset>
 <label for="weekday_minutes">Typical weekday workout duration</label>
 <input id="weekday_minutes" type="number" name="weekday_minutes" min="0" max="1440" step="5" value="{escape(str(weekday_minutes))}" required>
 <label for="weekend_minutes">Typical weekend workout duration</label>
