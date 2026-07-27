@@ -1913,7 +1913,7 @@ def api_whoami(user_id):
 def api_context(user_id):
     payload = api_coaching_context(user_id)
     payload["user_id"] = user_id
-    payload["debug_version"] = "multiuser-step18-coaching-api"
+    payload["debug_version"] = "multiuser-step18a-coaching-api"
     return jsonify(payload)
 
 
@@ -2661,6 +2661,10 @@ def mcp_jsonrpc_result(request_id, result, status=200):
     })
     response.status_code = status
     response.headers["Cache-Control"] = "no-store"
+    response.headers["MCP-Protocol-Version"] = request.headers.get(
+        "MCP-Protocol-Version",
+        "2025-06-18",
+    )
     return response
 
 
@@ -2675,6 +2679,10 @@ def mcp_jsonrpc_error(request_id, code, message, status=200):
     })
     response.status_code = status
     response.headers["Cache-Control"] = "no-store"
+    response.headers["MCP-Protocol-Version"] = request.headers.get(
+        "MCP-Protocol-Version",
+        "2025-06-18",
+    )
     return response
 
 
@@ -2855,27 +2863,105 @@ def call_mcp_tool(user_id, tool_name, arguments):
     return {"error": f"Unknown tool: {tool_name}"}, 404
 
 
+
+@app.route("/mcp-check/<api_key>", methods=["GET"])
+def claude_mcp_check(api_key):
+    user_id = user_id_for_api_key(api_key)
+    if not user_id:
+        return jsonify({
+            "ok": False,
+            "error": "Invalid or revoked connector key",
+        }), 401
+
+    return jsonify({
+        "ok": True,
+        "user_id": user_id,
+        "protocol_versions": [
+            "2024-11-05",
+            "2025-03-26",
+            "2025-06-18",
+            "2025-11-25",
+        ],
+        "tool_count": len(MCP_TOOLS),
+        "tools": [tool["name"] for tool in MCP_TOOLS],
+    })
+
 @app.route("/mcp/<api_key>", methods=["GET", "POST"])
 def claude_mcp(api_key):
     user_id = user_id_for_api_key(api_key)
     if not user_id:
         return mcp_jsonrpc_error(None, -32001, "Invalid or revoked connector key", 401)
 
-    origin = request.headers.get("Origin")
-    allowed_origins = {
-        "https://claude.ai",
-        request.url_root.rstrip("/"),
-    }
-    if origin and origin not in allowed_origins:
+    origin = (request.headers.get("Origin") or "").lower()
+    blocked_origin_tokens = (
+        "://localhost",
+        "://127.0.0.1",
+        "://[::1]",
+    )
+    if origin and any(token in origin for token in blocked_origin_tokens):
         return mcp_jsonrpc_error(None, -32002, "Origin not allowed", 403)
 
     if request.method == "GET":
         return Response(status=405, headers={
             "Allow": "POST",
             "Cache-Control": "no-store",
+            "MCP-Protocol-Version": request.headers.get(
+                "MCP-Protocol-Version",
+                "2025-06-18",
+            ),
         })
 
     message = request.get_json(silent=True)
+    if isinstance(message, list):
+        if not message:
+            return mcp_jsonrpc_error(None, -32600, "Empty JSON-RPC batch", 400)
+
+        batch_results = []
+        for item in message:
+            if not isinstance(item, dict):
+                batch_results.append({
+                    "jsonrpc": "2.0",
+                    "id": None,
+                    "error": {"code": -32600, "message": "Invalid Request"},
+                })
+                continue
+
+            item_id = item.get("id")
+            item_method = item.get("method")
+            item_params = item.get("params") or {}
+
+            if item_method == "tools/list":
+                batch_results.append({
+                    "jsonrpc": "2.0",
+                    "id": item_id,
+                    "result": {"tools": MCP_TOOLS},
+                })
+            elif item_method == "ping":
+                batch_results.append({
+                    "jsonrpc": "2.0",
+                    "id": item_id,
+                    "result": {},
+                })
+            elif item_method == "notifications/initialized":
+                continue
+            else:
+                batch_results.append({
+                    "jsonrpc": "2.0",
+                    "id": item_id,
+                    "error": {
+                        "code": -32601,
+                        "message": f"Method not found: {item_method}",
+                    },
+                })
+
+        response = jsonify(batch_results)
+        response.headers["Cache-Control"] = "no-store"
+        response.headers["MCP-Protocol-Version"] = request.headers.get(
+            "MCP-Protocol-Version",
+            "2025-06-18",
+        )
+        return response
+
     if not isinstance(message, dict):
         return mcp_jsonrpc_error(None, -32700, "Invalid JSON", 400)
 
@@ -2885,7 +2971,12 @@ def claude_mcp(api_key):
 
     if method == "initialize":
         requested_version = params.get("protocolVersion")
-        supported_versions = {"2025-03-26", "2025-06-18"}
+        supported_versions = {
+            "2024-11-05",
+            "2025-03-26",
+            "2025-06-18",
+            "2025-11-25",
+        }
         protocol_version = (
             requested_version if requested_version in supported_versions
             else "2025-06-18"
@@ -2908,7 +2999,13 @@ def claude_mcp(api_key):
         })
 
     if method == "notifications/initialized":
-        return Response(status=202, headers={"Cache-Control": "no-store"})
+        return Response(status=202, headers={
+            "Cache-Control": "no-store",
+            "MCP-Protocol-Version": request.headers.get(
+                "MCP-Protocol-Version",
+                "2025-06-18",
+            ),
+        })
 
     if method == "ping":
         return mcp_jsonrpc_result(request_id, {})
