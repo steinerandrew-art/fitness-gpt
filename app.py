@@ -879,14 +879,20 @@ def account_onboarding_state(user_id, token):
         profile and profile.get("withings_onboarding_status") == "skipped"
     )
     ai_status = supabase_ai_integration(user_id, token)
+    strava_connected = bool(
+        isinstance(strava_status, dict) and strava_status.get("connected")
+    )
+    withings_connected = bool(
+        isinstance(withings_status, dict) and withings_status.get("connected")
+    )
     state = onboarding_state(
         profile,
         training,
         context,
-        goals,
+        goals or [],
         integrations={
-            "strava": strava_status["connected"],
-            "withings": withings_status["connected"],
+            "strava": strava_connected,
+            "withings": withings_connected,
             "withings_skipped": withings_skipped,
             "ai": bool(ai_status and ai_status.get("enabled")),
         },
@@ -1698,9 +1704,34 @@ def account_revoke_integration_key(session_data):
 @require_account
 def account(session_data):
     user_id, token = session_data["user_id"], session_data["access_token"]
-    profile, training, context, goals, strava_status, withings_status, withings_skipped, ai_status, state = account_onboarding_state(user_id, token)
-    if not profile:
+    try:
+        (
+            profile,
+            training,
+            context,
+            goals,
+            strava_status,
+            withings_status,
+            withings_skipped,
+            ai_status,
+            state,
+        ) = account_onboarding_state(user_id, token)
+    except Exception:
+        app.logger.exception("Failed to build account onboarding state")
+        return account_page(
+            "Account error",
+            '<h1>Account unavailable</h1>'
+            '<p class="error">The account page could not load its current status. '
+            'The error has been written to the server log.</p>'
+            '<div class="actions"><a class="button subtle" href="/">Return home</a></div>',
+        ), 500
+
+    if not isinstance(profile, dict):
         return account_page("Account error", '<h1>Account unavailable</h1>'), 500
+
+    goals = goals if isinstance(goals, list) else []
+    strava_status = strava_status if isinstance(strava_status, dict) else {}
+    withings_status = withings_status if isinstance(withings_status, dict) else {}
     next_step = state["next_step"]
     next_html = (
         f'<p><strong>Next step:</strong> {escape(next_step["label"])}</p>'
@@ -1718,15 +1749,15 @@ def account(session_data):
         '<a class="button subtle" href="/privacy">Privacy policy</a>',
     ])
     return account_page("Account", f"""
-<h1>{escape(profile.get("display_name") or profile["username"])}</h1>
+<h1>{escape(profile.get("display_name") or profile.get("username") or profile.get("email") or "Account")}</h1>
 <dl>
 <dt>Location</dt><dd>{escape(profile.get("weather_location") or "")}</dd>
 <dt>Time zone</dt><dd>{escape(profile.get("timezone") or "")}</dd>
 <dt>Training profile</dt><dd>{"Configured" if training_step_complete(training) else "Not configured"}</dd>
 <dt>Coaching context</dt><dd>{"Configured" if context_step_complete(context) else "Not configured"}</dd>
 <dt>Goals</dt><dd>{len(goals)} configured</dd>
-<dt>Strava</dt><dd>{"Connected" if strava_status["connected"] else "Not connected"}</dd>
-<dt>Withings</dt><dd>{"Connected" if withings_status["connected"] else ("Skipped" if withings_skipped else "Not configured")}</dd>
+<dt>Strava</dt><dd>{"Connected" if strava_status.get("connected") else "Not connected"}</dd>
+<dt>Withings</dt><dd>{"Connected" if withings_status.get("connected") else ("Skipped" if withings_skipped else "Not configured")}</dd>
 <dt>AI access</dt><dd>{"Active" if ai_status and ai_status.get("enabled") else "Not configured"}</dd>
 <dt>Onboarding</dt><dd>{"Complete" if state["complete"] else "In progress"}</dd>
 </dl>{next_html}
@@ -2032,7 +2063,7 @@ def api_whoami(user_id):
 def api_context(user_id):
     payload = api_coaching_context(user_id)
     payload["user_id"] = user_id
-    payload["debug_version"] = "multiuser-step19-coaching-api"
+    payload["debug_version"] = "multiuser-step19a-coaching-api"
     return jsonify(payload)
 
 

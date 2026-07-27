@@ -168,14 +168,33 @@ def profile_step_complete(profile):
         and profile.get("weather_location")
     )
 
+def _positive_priority(value):
+    try:
+        return int((value or {}).get("priority") or 0) > 0
+    except (TypeError, ValueError, AttributeError):
+        return False
+
+
+def _integer_like(value):
+    try:
+        int(value)
+        return value is not None and str(value).strip() != ""
+    except (TypeError, ValueError):
+        return False
+
+
 def training_step_complete(training):
+    preferences = (
+        training.get("activity_preferences")
+        if isinstance(training, dict)
+        else None
+    )
     return bool(
-        training
-        and isinstance(training.get("activity_preferences"), dict)
-        and any((value or {}).get("priority", 0) > 0
-                for value in training.get("activity_preferences", {}).values())
-        and isinstance(training.get("weekday_minutes"), int)
-        and isinstance(training.get("weekend_minutes"), int)
+        isinstance(training, dict)
+        and isinstance(preferences, dict)
+        and any(_positive_priority(value) for value in preferences.values())
+        and _integer_like(training.get("weekday_minutes"))
+        and _integer_like(training.get("weekend_minutes"))
         and training.get("coaching_style")
         and training.get("bad_weather_strategy")
     )
