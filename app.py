@@ -1548,8 +1548,28 @@ def onboarding_integrations(session_data):
 5. Treat the coaching context as persistent user instructions. Do not invent missing measurements or claim unavailable data is current.
 6. When Withings is unavailable or intentionally skipped, use Strava and stored coaching context and clearly identify the limitation.
 7. Give practical recommendations that account for available time, preferred activities, equipment, weather strategy, and stated goals.</pre>
+<h3>Suggested Claude project instructions</h3>
+<pre style="white-space:pre-wrap">For every request involving current fitness, workouts, readiness, body composition, training plans, or individualized coaching:
+
+1. Use get_current_fitness_account to verify the connected account.
+2. Use get_coaching_context and get_fitness_summary before answering.
+3. Do not claim the data is unavailable until you have attempted the relevant connector tools.
+4. Use get_recent_workouts or the activity tools when the summary is insufficient.
+5. Treat stored coaching context as persistent user instructions.
+6. Clearly distinguish current retrieved data from assumptions or general guidance.</pre>
 <p class="muted">Creating or editing a custom GPT requires a ChatGPT plan that supports GPT creation. The fitness API key authenticates only to this coaching backend; it is not an OpenAI credential.</p>
 <p class="muted">Replacing or revoking the key immediately disables the previous key.</p>
+<h2>Claude connector setup</h2>
+<p>Claude uses a remote MCP connector rather than the OpenAPI schema. Build the connector URL using the full API key shown only when you generate or replace it:</p>
+<p><code style="word-break:break-all">{escape(request.url_root.rstrip("/") + "/mcp/YOUR_FULL_API_KEY")}</code></p>
+<ol>
+  <li>In Claude, open <strong>Settings → Connectors</strong>.</li>
+  <li>Select <strong>Add custom connector</strong>.</li>
+  <li>Name it <strong>Fitness Coach</strong>.</li>
+  <li>Replace <code>YOUR_FULL_API_KEY</code> in the URL above with the complete generated key and paste the resulting URL.</li>
+  <li>Enable the connector in the conversation’s Search and tools menu.</li>
+</ol>
+<p class="muted">Treat the connector URL like a password. Replacing or revoking the fitness API key immediately invalidates the old connector URL.</p>
 """)
 
 
@@ -1893,7 +1913,7 @@ def api_whoami(user_id):
 def api_context(user_id):
     payload = api_coaching_context(user_id)
     payload["user_id"] = user_id
-    payload["debug_version"] = "multiuser-step17c-coaching-api"
+    payload["debug_version"] = "multiuser-step18-coaching-api"
     return jsonify(payload)
 
 
@@ -2631,6 +2651,291 @@ def calculate_readiness(summary_data, withings_data):
         "reasons": reasons
     }
 
+
+
+def mcp_jsonrpc_result(request_id, result, status=200):
+    response = jsonify({
+        "jsonrpc": "2.0",
+        "id": request_id,
+        "result": result,
+    })
+    response.status_code = status
+    response.headers["Cache-Control"] = "no-store"
+    return response
+
+
+def mcp_jsonrpc_error(request_id, code, message, status=200):
+    response = jsonify({
+        "jsonrpc": "2.0",
+        "id": request_id,
+        "error": {
+            "code": code,
+            "message": message,
+        },
+    })
+    response.status_code = status
+    response.headers["Cache-Control"] = "no-store"
+    return response
+
+
+def mcp_tool_result(payload, is_error=False):
+    return {
+        "content": [{
+            "type": "text",
+            "text": json.dumps(payload, ensure_ascii=False, default=str),
+        }],
+        "structuredContent": payload if isinstance(payload, dict) else {"result": payload},
+        "isError": bool(is_error),
+    }
+
+
+def response_payload(response_value):
+    status = 200
+    value = response_value
+
+    if isinstance(response_value, tuple):
+        value = response_value[0]
+        if len(response_value) > 1:
+            status = response_value[1]
+
+    if hasattr(value, "status_code"):
+        status = value.status_code
+
+    if hasattr(value, "get_json"):
+        payload = value.get_json(silent=True)
+        if payload is None:
+            payload = {"result": value.get_data(as_text=True)}
+    elif isinstance(value, dict):
+        payload = value
+    else:
+        payload = {"result": str(value)}
+
+    return payload, status
+
+
+MCP_TOOLS = [
+    {
+        "name": "get_current_fitness_account",
+        "title": "Current Fitness Account",
+        "description": "Verify the connected fitness account before giving personalized coaching.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {},
+            "additionalProperties": False,
+        },
+        "annotations": {
+            "readOnlyHint": True,
+            "destructiveHint": False,
+            "idempotentHint": True,
+            "openWorldHint": False,
+        },
+    },
+    {
+        "name": "get_coaching_context",
+        "title": "Coaching Context",
+        "description": "Load the user's profile, goals, preferences, constraints, equipment, and persistent coaching context.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {},
+            "additionalProperties": False,
+        },
+        "annotations": {
+            "readOnlyHint": True,
+            "destructiveHint": False,
+            "idempotentHint": True,
+            "openWorldHint": False,
+        },
+    },
+    {
+        "name": "get_fitness_summary",
+        "title": "Fitness Summary",
+        "description": "Load the recent 14-day fitness summary, intensity, readiness, and available Withings data.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {},
+            "additionalProperties": False,
+        },
+        "annotations": {
+            "readOnlyHint": True,
+            "destructiveHint": False,
+            "idempotentHint": True,
+            "openWorldHint": True,
+        },
+    },
+    {
+        "name": "get_recent_workouts",
+        "title": "Recent Workouts",
+        "description": "Load recent workouts when the summary is not detailed enough.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {},
+            "additionalProperties": False,
+        },
+        "annotations": {
+            "readOnlyHint": True,
+            "destructiveHint": False,
+            "idempotentHint": True,
+            "openWorldHint": True,
+        },
+    },
+    {
+        "name": "get_activity_detail",
+        "title": "Activity Detail",
+        "description": "Load detailed information for one Strava activity.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "activity_id": {
+                    "type": "integer",
+                    "description": "The Strava activity ID.",
+                }
+            },
+            "required": ["activity_id"],
+            "additionalProperties": False,
+        },
+        "annotations": {
+            "readOnlyHint": True,
+            "destructiveHint": False,
+            "idempotentHint": True,
+            "openWorldHint": True,
+        },
+    },
+    {
+        "name": "get_activity_zones",
+        "title": "Activity Zones",
+        "description": "Load heart-rate, power, or pace zones for one Strava activity.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "activity_id": {
+                    "type": "integer",
+                    "description": "The Strava activity ID.",
+                }
+            },
+            "required": ["activity_id"],
+            "additionalProperties": False,
+        },
+        "annotations": {
+            "readOnlyHint": True,
+            "destructiveHint": False,
+            "idempotentHint": True,
+            "openWorldHint": True,
+        },
+    },
+]
+
+
+def call_mcp_tool(user_id, tool_name, arguments):
+    arguments = arguments or {}
+
+    if tool_name == "get_current_fitness_account":
+        return response_payload(api_whoami.__wrapped__(user_id))
+
+    if tool_name == "get_coaching_context":
+        return response_payload(api_context.__wrapped__(user_id))
+
+    if tool_name == "get_fitness_summary":
+        return response_payload(summary.__wrapped__(user_id))
+
+    if tool_name == "get_recent_workouts":
+        return response_payload(workouts.__wrapped__(user_id))
+
+    if tool_name == "get_activity_detail":
+        activity_id = arguments.get("activity_id")
+        if not isinstance(activity_id, int):
+            return {"error": "activity_id must be an integer"}, 400
+        return response_payload(activity_detail.__wrapped__(user_id, activity_id))
+
+    if tool_name == "get_activity_zones":
+        activity_id = arguments.get("activity_id")
+        if not isinstance(activity_id, int):
+            return {"error": "activity_id must be an integer"}, 400
+        return response_payload(activity_zones.__wrapped__(user_id, activity_id))
+
+    return {"error": f"Unknown tool: {tool_name}"}, 404
+
+
+@app.route("/mcp/<api_key>", methods=["GET", "POST"])
+def claude_mcp(api_key):
+    user_id = user_id_for_api_key(api_key)
+    if not user_id:
+        return mcp_jsonrpc_error(None, -32001, "Invalid or revoked connector key", 401)
+
+    origin = request.headers.get("Origin")
+    allowed_origins = {
+        "https://claude.ai",
+        request.url_root.rstrip("/"),
+    }
+    if origin and origin not in allowed_origins:
+        return mcp_jsonrpc_error(None, -32002, "Origin not allowed", 403)
+
+    if request.method == "GET":
+        return Response(status=405, headers={
+            "Allow": "POST",
+            "Cache-Control": "no-store",
+        })
+
+    message = request.get_json(silent=True)
+    if not isinstance(message, dict):
+        return mcp_jsonrpc_error(None, -32700, "Invalid JSON", 400)
+
+    request_id = message.get("id")
+    method = message.get("method")
+    params = message.get("params") or {}
+
+    if method == "initialize":
+        requested_version = params.get("protocolVersion")
+        supported_versions = {"2025-03-26", "2025-06-18"}
+        protocol_version = (
+            requested_version if requested_version in supported_versions
+            else "2025-06-18"
+        )
+        return mcp_jsonrpc_result(request_id, {
+            "protocolVersion": protocol_version,
+            "capabilities": {
+                "tools": {
+                    "listChanged": False,
+                }
+            },
+            "serverInfo": {
+                "name": "Fitness Coaching Connector",
+                "version": "18.0",
+            },
+            "instructions": (
+                "Verify the account, then load coaching context and fitness "
+                "summary before giving individualized training advice."
+            ),
+        })
+
+    if method == "notifications/initialized":
+        return Response(status=202, headers={"Cache-Control": "no-store"})
+
+    if method == "ping":
+        return mcp_jsonrpc_result(request_id, {})
+
+    if method == "tools/list":
+        return mcp_jsonrpc_result(request_id, {"tools": MCP_TOOLS})
+
+    if method == "tools/call":
+        tool_name = params.get("name")
+        arguments = params.get("arguments") or {}
+        if not isinstance(tool_name, str):
+            return mcp_jsonrpc_error(request_id, -32602, "Tool name is required")
+
+        payload, status = call_mcp_tool(user_id, tool_name, arguments)
+        if status == 404 and payload.get("error", "").startswith("Unknown tool"):
+            return mcp_jsonrpc_error(request_id, -32602, payload["error"])
+
+        return mcp_jsonrpc_result(
+            request_id,
+            mcp_tool_result(payload, is_error=status >= 400),
+        )
+
+    return mcp_jsonrpc_error(
+        request_id,
+        -32601,
+        f"Method not found: {method}",
+    )
 
 @app.route("/summary")
 @require_api_user
