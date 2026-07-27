@@ -40,7 +40,9 @@ from functools import wraps
 
 from onboarding_support import (
     ACTIVITY_FREQUENCY_OPTIONS,
+    ACTIVITY_GROUPS,
     ACTIVITY_OPTIONS,
+    LEGACY_ACTIVITY_ALIASES,
     COACHING_STYLE_OPTIONS,
     COMMON_TIMEZONES,
     EQUIPMENT_OPTIONS,
@@ -764,7 +766,10 @@ fieldset{{margin:20px 0;padding:16px;border:1px solid #dfe4ea;border-radius:10px
 .wizard-progress{{list-style:none;padding:0;margin:0 0 24px;display:grid;gap:8px}} .wizard-progress li{{display:flex;justify-content:space-between;padding:9px 12px;border-radius:8px;background:#f1f3f5}} .wizard-progress .complete{{background:#eafaf1}} .wizard-progress .current{{background:#eaf2f8;font-weight:700}}
 .actions{{display:flex;gap:12px;flex-wrap:wrap;align-items:center}} .account-actions{{margin:18px 0}} .account-actions .button{{margin-top:0}} .muted{{color:#5d6d7e}}
 .table-scroll{{overflow-x:auto}} .preference-table{{width:100%;border-collapse:collapse}} .preference-table th,.preference-table td{{padding:8px;text-align:left;vertical-align:middle;border-bottom:1px solid #e5e8eb}} .preference-table thead th{{font-size:.9rem;color:#5d6d7e}} .preference-table tbody th{{width:64px;text-align:center}} .preference-table select{{min-width:190px}}
-</style></head><body><main>{body}</main></body></html>"""
+</style></head><body><main>{body}
+<footer style="margin-top:32px;padding-top:18px;border-top:1px solid #e5e8eb;font-size:.92rem;color:#5d6d7e">
+<a href="/privacy">Privacy Policy</a>
+</footer></main></body></html>"""
 
 
 def login_form(error_message=None):
@@ -775,7 +780,7 @@ def login_form(error_message=None):
 <label for="identifier">Email or username</label><input id="identifier" name="identifier" autocomplete="username" required>
 <label for="password">Password</label><input id="password" type="password" name="password" autocomplete="current-password" required>
 <button type="submit">Log in</button></form>
-<p>Need an account? <a href="/register">Create one</a>.</p>""")
+<p>Need an account? <a href="/register">Create one</a>.</p><p class="muted">By using this service, you acknowledge the <a href="/privacy">Privacy Policy</a>.</p>""")
 
 
 def registration_form(error_message=None):
@@ -788,7 +793,7 @@ def registration_form(error_message=None):
 <label for="display_name">Display name</label><input id="display_name" name="display_name" autocomplete="name">
 <label for="password">Password</label><input id="password" type="password" name="password" minlength="8" autocomplete="new-password" required>
 <button type="submit">Create account</button></form>
-<p>Already registered? <a href="/login">Log in</a>.</p>""")
+<p>Already registered? <a href="/login">Log in</a>.</p><p class="muted">By creating an account, you acknowledge the <a href="/privacy">Privacy Policy</a>.</p>""")
 
 
 @app.route("/register", methods=["GET", "POST"])
@@ -1090,7 +1095,20 @@ def onboarding_training(session_data):
             if not error_message:
                 return redirect("/onboarding/context")
 
-    saved_preferences = training.get("activity_preferences") or {}
+    raw_saved_preferences = training.get("activity_preferences") or {}
+    saved_preferences = {}
+    for activity_key, preference in raw_saved_preferences.items():
+        normalized_key = LEGACY_ACTIVITY_ALIASES.get(activity_key, activity_key)
+        # If both an old alias and its new Strava value exist, keep the record
+        # with the higher priority (lower number).
+        existing = saved_preferences.get(normalized_key)
+        if (
+            existing is None
+            or int((preference or {}).get("priority") or 999)
+            < int((existing or {}).get("priority") or 999)
+        ):
+            saved_preferences[normalized_key] = preference
+
     by_priority = {
         int(v.get("priority")): (k, v.get("frequency"))
         for k, v in saved_preferences.items() if (v or {}).get("priority")
@@ -1100,9 +1118,18 @@ def onboarding_training(session_data):
         saved_activity, saved_frequency = by_priority.get(priority, ("", ""))
         selected_activity = request.form.get(f"activity_{priority}", saved_activity)
         selected_frequency = request.form.get(f"frequency_{priority}", saved_frequency)
-        activity_options = '<option value="">— Leave blank —</option>' + "".join(
-            f'<option value="{k}" {"selected" if k == selected_activity else ""}>{escape(label)}</option>'
-            for k, label in ACTIVITY_OPTIONS
+        activity_groups_html = []
+        for group_label, activities in ACTIVITY_GROUPS:
+            group_options = "".join(
+                f'<option value="{key}" {"selected" if key == selected_activity else ""}>{escape(label)}</option>'
+                for key, label in activities
+            )
+            activity_groups_html.append(
+                f'<optgroup label="{escape(group_label)}">{group_options}</optgroup>'
+            )
+        activity_options = (
+            '<option value="">— Leave blank —</option>'
+            + "".join(activity_groups_html)
         )
         frequency_options = '<option value="">— Select frequency —</option>' + "".join(
             f'<option value="{k}" {"selected" if k == selected_frequency else ""}>{escape(label)}</option>'
@@ -1567,9 +1594,11 @@ def onboarding_integrations(session_data):
 1. Use get_current_fitness_account to verify the connected account.
 2. Use get_coaching_context and get_fitness_summary before answering.
 3. Do not claim the data is unavailable until you have attempted the relevant connector tools.
-4. Use get_recent_workouts or the activity tools when the summary is insufficient.
-5. Treat stored coaching context as persistent user instructions.
-6. Clearly distinguish current retrieved data from assumptions or general guidance.</pre>
+4. Use get_recent_workouts, get_activity_detail, or get_activity_zones when the summary is insufficient.
+5. Treat stored coaching context as persistent user instructions, including goals, constraints, preferred activities, equipment, available time, and weather strategy.
+6. When Withings is unavailable or intentionally skipped, rely on Strava and stored coaching context and clearly identify that limitation.
+7. Do not invent missing measurements or describe unretrieved information as current.
+8. Give practical recommendations and clearly distinguish retrieved data, reasonable inference, and general guidance.</pre>
 <p class="muted">Creating or editing a custom GPT requires a ChatGPT plan that supports GPT creation. The fitness API key authenticates only to this coaching backend; it is not an OpenAI credential.</p>
 <p class="muted">Replacing or revoking the key immediately disables the previous key.</p>
 <h2>Claude connector setup</h2>
@@ -1583,6 +1612,7 @@ def onboarding_integrations(session_data):
   <li>Enable the connector in the conversation’s Search and tools menu.</li>
 </ol>
 <p class="muted">Treat the connector URL like a password. Replacing or revoking the fitness API key immediately invalidates the old connector URL.</p>
+<p>Review the <a href="/privacy">Privacy Policy</a> for details about connected data, storage, AI clients, and account deletion.</p>
 """)
 
 
@@ -1685,6 +1715,7 @@ def account(session_data):
         '<a class="button subtle" href="/onboarding/strava">Strava connection</a>',
         '<a class="button subtle" href="/onboarding/withings">Withings connection</a>',
         '<a class="button subtle" href="/onboarding/integrations">AI integrations</a>',
+        '<a class="button subtle" href="/privacy">Privacy policy</a>',
     ])
     return account_page("Account", f"""
 <h1>{escape(profile.get("display_name") or profile["username"])}</h1>
@@ -1702,7 +1733,7 @@ def account(session_data):
 <div class="actions account-actions">{links}</div>
 {"<div class='success'><strong>Onboarding complete.</strong> Your account is ready for an AI coaching client.</div>" if state.get("complete") else ""}
 <h2>Set up your AI coach</h2>
-<p>Use the AI Integrations page to generate or replace an API key and copy the exact OpenAPI schema URL for this deployment.</p>
+<p>Use the AI Integrations page to configure ChatGPT or Claude, generate or replace an integration key, and copy the current setup instructions.</p>
 <ol>
   <li>Create or edit your custom GPT.</li>
   <li>Import the OpenAPI schema shown on the AI Integrations page.</li>
@@ -1794,15 +1825,90 @@ def setup_dashboard(user_id, message=None):
     </form>
     """
 
+@app.route("/privacy")
+def privacy_policy():
+    operator_name = os.getenv("PRIVACY_OPERATOR_NAME", "Fitness Coaching")
+    contact_email = os.getenv("PRIVACY_CONTACT_EMAIL", "").strip()
+    contact_html = (
+        f'<a href="mailto:{escape(contact_email)}">{escape(contact_email)}</a>'
+        if contact_email
+        else "the service operator using the contact information supplied with your account"
+    )
+    effective_date = "July 27, 2026"
+
+    return account_page("Privacy Policy", f"""
+<h1>Privacy Policy</h1>
+<p><strong>Effective date:</strong> {effective_date}</p>
+<p>This policy explains how {escape(operator_name)} (“the service,” “we,” or “us”) collects, uses, stores, and shares information when you create an account, connect fitness services, and use an AI coaching client with this service.</p>
+
+<h2>1. What the service does</h2>
+<p>The service retrieves fitness and wellness information that you authorize, combines it with goals and coaching preferences you provide, and makes that information available to an AI coaching client you choose, such as ChatGPT or Claude. The service is intended for general fitness coaching and planning. It is not medical care, diagnosis, or treatment.</p>
+
+<h2>2. Information we collect</h2>
+<ul>
+  <li><strong>Account information:</strong> email address, username, display name, authentication identifiers, time zone, units, and account status.</li>
+  <li><strong>Profile and coaching information:</strong> date of birth, height, optional biological sex, location used for weather-aware coaching, heart-rate or FTP overrides, goals, preferred activities, available training time, equipment, constraints, coaching preferences, and other context you submit.</li>
+  <li><strong>Strava information:</strong> account connection status and authorized activity data, which may include activity names, sport types, dates, durations, distances, elevation, heart rate, power, pace, zones, streams, and related athlete information permitted by the scopes you approve.</li>
+  <li><strong>Withings information:</strong> when connected, authorized measurements and summaries such as weight and body-composition information. Withings is optional.</li>
+  <li><strong>Integration information:</strong> enabled AI providers, hashed integration credentials, credential prefixes, OAuth connection metadata, and requests made through the coaching API or MCP connector.</li>
+  <li><strong>Technical information:</strong> server logs and security information such as timestamps, request paths, error details, IP-derived network information, and user-agent information generated by hosting and infrastructure providers.</li>
+</ul>
+
+<h2>3. How we use information</h2>
+<p>We use information to authenticate accounts; connect and refresh authorized data sources; retrieve and summarize fitness data; provide account-specific context to authorized AI coaching clients; maintain preferences and goals; troubleshoot errors; protect the service; and improve reliability and functionality.</p>
+<p>We do not sell personal information or use connected fitness information for advertising.</p>
+
+<h2>4. AI coaching clients</h2>
+<p>When you enable ChatGPT, Claude, or another supported client, that client may request information from the service to answer your prompts. The service returns only information associated with the authenticated account and the requested coaching function. The AI provider separately processes prompts, tool requests, and returned data under its own terms and privacy policy. Do not connect an AI provider unless you are comfortable with that provider processing the information returned to it.</p>
+
+<h2>5. Authorization credentials</h2>
+<p>Strava and Withings access and refresh tokens are stored so the service can retrieve information you authorized without requiring you to reconnect for every request. AI integration keys are stored as cryptographic hashes rather than plaintext. During the current Claude connector implementation, the full connector URL contains a secret credential and should be treated like a password. Replacing or revoking the credential invalidates the previous connector URL.</p>
+
+<h2>6. Service providers and disclosures</h2>
+<p>Information may be processed by service providers necessary to operate the service, including hosting, database, authentication, logging, and connected-platform providers. Current infrastructure may include Render and Supabase, while connected data and AI requests may involve Strava, Withings, OpenAI, or Anthropic depending on what you enable.</p>
+<p>We may also disclose information when reasonably necessary to comply with law, protect users or the service, investigate abuse or security incidents, or complete a business transfer. We do not authorize service providers to use account information for their own advertising.</p>
+
+<h2>7. Retention and deletion</h2>
+<p>We retain account, coaching, connection, and integration information while your account remains active or as reasonably necessary to provide and secure the service. Operational logs may be retained for a shorter period determined by infrastructure settings. Disconnecting Strava or Withings stops future retrieval but may not automatically delete previously stored profile or summary information.</p>
+<p>You may request account deletion and deletion of associated stored data by contacting {contact_html}. Some limited records may be retained when required for security, legal compliance, fraud prevention, or backup integrity.</p>
+
+<h2>8. Your choices</h2>
+<ul>
+  <li>You may leave Withings disconnected or mark it as skipped.</li>
+  <li>You may disconnect Strava or Withings and revoke access through the connected platform.</li>
+  <li>You may replace or revoke AI integration credentials from the AI Integrations page.</li>
+  <li>You may edit coaching context, profile information, goals, and activity preferences through your account.</li>
+  <li>You may request access, correction, export, or deletion of stored information by contacting {contact_html}.</li>
+</ul>
+
+<h2>9. Security</h2>
+<p>We use measures intended to reduce unauthorized access, including encrypted HTTPS connections, account authentication, scoped platform authorization, server-side credential storage, hashed AI integration keys, and account-level authorization checks. No system can guarantee absolute security. You are responsible for protecting your password, integration keys, and Claude connector URL.</p>
+
+<h2>10. Health and fitness disclaimer</h2>
+<p>Fitness, wellness, and body-composition information can be sensitive. This service is not represented as a healthcare provider or HIPAA-compliant service, and it should not be used to store or transmit information requiring a HIPAA-regulated environment. Coaching output may be incomplete or incorrect and should not replace professional medical advice, diagnosis, or treatment.</p>
+
+<h2>11. Children</h2>
+<p>The service is not intended for children under 13, and we do not knowingly collect personal information directly from children under 13. Do not create an account for a child or connect a child’s fitness data without confirming that doing so is lawful and appropriate.</p>
+
+<h2>12. Changes to this policy</h2>
+<p>We may update this policy as the service, integrations, or legal requirements change. The revised policy will be posted here with a new effective date. Material changes may also be communicated through the account interface when practical.</p>
+
+<h2>13. Contact</h2>
+<p>Questions, privacy requests, and deletion requests may be directed to {contact_html}.</p>
+<div class="actions"><a class="button subtle" href="/">Return home</a><a class="button subtle" href="/account">Account</a></div>
+""")
+
 @app.route("/")
 def home():
-    return """
-    <h1>Fitness GPT backend is running</h1>
-    <p><a href="/account">Account login and profile</a></p>
-    <p><a href="/setup">Legacy API-key setup</a></p>
-    <p><a href="/workouts">View workouts</a></p>
-    <p><a href="/summary">View summary</a></p>
-    """
+    return account_page("Fitness Coaching", """
+<h1>Fitness Coaching</h1>
+<p>Connect your fitness accounts and provide individualized coaching context for use with supported AI coaching clients.</p>
+<div class="actions">
+  <a class="button" href="/account">Account login and profile</a>
+  <a class="button subtle" href="/privacy">Privacy policy</a>
+</div>
+<p class="muted">Fitness data endpoints require an authenticated AI integration. The legacy setup route remains available for compatibility but is no longer linked from this directory.</p>
+""")
 
 
 @app.route("/setup", methods=["GET", "POST"])
@@ -1926,7 +2032,7 @@ def api_whoami(user_id):
 def api_context(user_id):
     payload = api_coaching_context(user_id)
     payload["user_id"] = user_id
-    payload["debug_version"] = "multiuser-step18b-coaching-api"
+    payload["debug_version"] = "multiuser-step19-coaching-api"
     return jsonify(payload)
 
 

@@ -17,17 +17,102 @@ COMMON_TIMEZONES = [
     "Europe/London", "Europe/Paris", "Asia/Tokyo", "Australia/Sydney",
 ]
 
-ACTIVITY_OPTIONS = [
-    ("road_cycling", "Road cycling"),
-    ("gravel_cycling", "Gravel cycling"),
-    ("mountain_biking", "Mountain biking"),
-    ("indoor_cycling", "Indoor cycling"),
-    ("running", "Running"),
-    ("walking", "Walking"),
-    ("strength_training", "Strength training"),
-    ("cross_country_skiing", "Cross-country skiing"),
-    ("other", "Other activity"),
+# Values use Strava's SportType enumeration so stored preferences can be
+# compared directly with retrieved activities. Labels are grouped in the UI.
+ACTIVITY_GROUPS = [
+    ("Cycling", [
+        ("Ride", "Road or general cycling"),
+        ("GravelRide", "Gravel cycling"),
+        ("MountainBikeRide", "Mountain biking"),
+        ("EBikeRide", "E-bike riding"),
+        ("EMountainBikeRide", "E-mountain biking"),
+        ("VirtualRide", "Indoor or virtual cycling"),
+        ("Handcycle", "Handcycling"),
+        ("Velomobile", "Velomobile"),
+    ]),
+    ("Running and walking", [
+        ("Run", "Road or general running"),
+        ("TrailRun", "Trail running"),
+        ("VirtualRun", "Indoor or virtual running"),
+        ("Walk", "Walking"),
+        ("Hike", "Hiking"),
+        ("Wheelchair", "Wheelchair activity"),
+    ]),
+    ("Strength, fitness, and rehabilitation", [
+        ("WeightTraining", "Strength training"),
+        ("Workout", "General workout"),
+        ("Crossfit", "CrossFit"),
+        ("HighIntensityIntervalTraining", "High-intensity interval training"),
+        ("Elliptical", "Elliptical"),
+        ("StairStepper", "Stair stepper"),
+        ("Yoga", "Yoga"),
+        ("Pilates", "Pilates"),
+        ("Dance", "Dance"),
+        ("PhysicalTherapy", "Physical therapy"),
+    ]),
+    ("Winter sports", [
+        ("AlpineSki", "Alpine skiing"),
+        ("BackcountrySki", "Backcountry skiing"),
+        ("NordicSki", "Cross-country skiing"),
+        ("RollerSki", "Roller skiing"),
+        ("Snowboard", "Snowboarding"),
+        ("Snowshoe", "Snowshoeing"),
+        ("IceSkate", "Ice skating"),
+    ]),
+    ("Water sports", [
+        ("Swim", "Swimming"),
+        ("Rowing", "Rowing"),
+        ("VirtualRow", "Indoor or virtual rowing"),
+        ("Canoeing", "Canoeing"),
+        ("Kayaking", "Kayaking"),
+        ("StandUpPaddling", "Stand-up paddling"),
+        ("Surfing", "Surfing"),
+        ("Kitesurf", "Kitesurfing"),
+        ("Windsurf", "Windsurfing"),
+        ("Sail", "Sailing"),
+    ]),
+    ("Racquet and court sports", [
+        ("Badminton", "Badminton"),
+        ("Padel", "Padel"),
+        ("Pickleball", "Pickleball"),
+        ("Racquetball", "Racquetball"),
+        ("Squash", "Squash"),
+        ("TableTennis", "Table tennis"),
+        ("Tennis", "Tennis"),
+    ]),
+    ("Team and field sports", [
+        ("Basketball", "Basketball"),
+        ("Cricket", "Cricket"),
+        ("Soccer", "Soccer"),
+        ("Volleyball", "Volleyball"),
+    ]),
+    ("Outdoor and other sports", [
+        ("Golf", "Golf"),
+        ("RockClimbing", "Rock climbing"),
+        ("InlineSkate", "Inline skating"),
+        ("Skateboard", "Skateboarding"),
+    ]),
 ]
+
+ACTIVITY_OPTIONS = [
+    activity
+    for _group_label, activities in ACTIVITY_GROUPS
+    for activity in activities
+]
+
+# Profiles saved before Step 19 used application-specific keys. They are
+# translated when the user next edits the training profile.
+LEGACY_ACTIVITY_ALIASES = {
+    "road_cycling": "Ride",
+    "gravel_cycling": "GravelRide",
+    "mountain_biking": "MountainBikeRide",
+    "indoor_cycling": "VirtualRide",
+    "running": "Run",
+    "walking": "Walk",
+    "strength_training": "WeightTraining",
+    "cross_country_skiing": "NordicSki",
+    "other": "Workout",
+}
 
 ACTIVITY_FREQUENCY_OPTIONS = [
     ("never", "Rarely or never"),
@@ -113,16 +198,15 @@ def goals_step_complete(goals):
         for goal in (goals or [])
     )
 
-def onboarding_state(profile, training, context=None, goals=None, integrations=None):
-    integrations = integrations or {}
+def onboarding_state(profile, training, context=None, goals=None):
     completion = {
         "profile": profile_step_complete(profile),
         "training": training_step_complete(training),
         "context": context_step_complete(context),
         "goals": goals_step_complete(goals),
-        "strava": bool(integrations.get("strava")),
-        "withings": bool(integrations.get("withings")) or bool(integrations.get("withings_skipped")),
-        "integrations": bool(integrations.get("ai")),
+        "strava": False,
+        "withings": False,
+        "integrations": False,
     }
     next_step = next(
         (step for step in ONBOARDING_STEPS if not completion[step["key"]]),
