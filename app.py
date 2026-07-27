@@ -10,7 +10,7 @@ from html import escape
 
 import requests
 
-from flask import Flask, jsonify, make_response, redirect, request
+from flask import Flask, Response, jsonify, make_response, redirect, request
 
 from strava_client import (
     CLIENT_ID,
@@ -119,17 +119,22 @@ def account_user_id_for_api_key(api_key):
     if not api_key:
         return None
 
-    response = requests.get(
-        f"{supabase_url()}/rest/v1/ai_integrations",
-        headers=supabase_headers(supabase_secret_key()),
-        params={
-            "select": "user_id",
-            "api_key_hash": f"eq.{api_key_digest(api_key)}",
-            "enabled": "eq.true",
-            "limit": "1",
-        },
-        timeout=20,
-    )
+    try:
+        response = requests.get(
+            f"{supabase_url()}/rest/v1/ai_integrations",
+            headers=supabase_headers(supabase_secret_key()),
+            params={
+                "select": "user_id",
+                "api_key_hash": f"eq.{api_key_digest(api_key)}",
+                "enabled": "eq.true",
+                "limit": "1",
+            },
+            timeout=20,
+        )
+    except requests.RequestException as exc:
+        app.logger.exception("Supabase API-key validation request failed")
+        return None
+
     if response.status_code != 200:
         app.logger.warning(
             "Could not validate account API key: %s",
@@ -137,7 +142,15 @@ def account_user_id_for_api_key(api_key):
         )
         return None
 
-    rows = response.json()
+    try:
+        rows = response.json()
+    except ValueError:
+        app.logger.error(
+            "Supabase API-key validation returned non-JSON content: %r",
+            response.text[:500],
+        )
+        return None
+
     return rows[0].get("user_id") if rows else None
 
 
@@ -1913,7 +1926,7 @@ def api_whoami(user_id):
 def api_context(user_id):
     payload = api_coaching_context(user_id)
     payload["user_id"] = user_id
-    payload["debug_version"] = "multiuser-step18a-coaching-api"
+    payload["debug_version"] = "multiuser-step18b-coaching-api"
     return jsonify(payload)
 
 
@@ -2866,25 +2879,36 @@ def call_mcp_tool(user_id, tool_name, arguments):
 
 @app.route("/mcp-check/<api_key>", methods=["GET"])
 def claude_mcp_check(api_key):
-    user_id = user_id_for_api_key(api_key)
-    if not user_id:
+    try:
+        user_id = user_id_for_api_key(api_key)
+        if not user_id:
+            return jsonify({
+                "ok": False,
+                "error": "Invalid or revoked connector key",
+            }), 401
+
+        return jsonify({
+            "ok": True,
+            "user_id": user_id,
+            "protocol_versions": [
+                "2024-11-05",
+                "2025-03-26",
+                "2025-06-18",
+                "2025-11-25",
+            ],
+            "tool_count": len(MCP_TOOLS),
+            "tools": [tool["name"] for tool in MCP_TOOLS],
+        })
+    except Exception as exc:
+        error_id = secrets.token_hex(4)
+        app.logger.exception("MCP diagnostic failed [%s]", error_id)
         return jsonify({
             "ok": False,
-            "error": "Invalid or revoked connector key",
-        }), 401
-
-    return jsonify({
-        "ok": True,
-        "user_id": user_id,
-        "protocol_versions": [
-            "2024-11-05",
-            "2025-03-26",
-            "2025-06-18",
-            "2025-11-25",
-        ],
-        "tool_count": len(MCP_TOOLS),
-        "tools": [tool["name"] for tool in MCP_TOOLS],
-    })
+            "error": "MCP diagnostic failed",
+            "error_id": error_id,
+            "exception_type": type(exc).__name__,
+            "detail": str(exc),
+        }), 500
 
 @app.route("/mcp/<api_key>", methods=["GET", "POST"])
 def claude_mcp(api_key):
