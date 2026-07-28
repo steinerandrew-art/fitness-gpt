@@ -1,16 +1,25 @@
-"""Remote MCP adapter for the Fitness Coaching API.
+"""OAuth-protected remote MCP adapter for the Fitness Coaching API.
 
-Claude connects to this server over Streamable HTTP. The server authenticates to
-an existing Flask fitness API with one account-specific bearer token and exposes
-the same read-only coaching data available to the ChatGPT Action integration.
+The Flask application is the OAuth authorization server and owns user identity.
+This service is the MCP resource server: it validates Claude's bearer token by
+calling the Flask app's introspection endpoint, then forwards that same token to
+the existing read-only fitness API endpoints.
+
+Set MCP_OAUTH_ENABLED=false temporarily to retain the previously validated
+single-account FITNESS_API_KEY behavior during deployment testing.
 """
 
 from __future__ import annotations
 
 import os
+import time
 from typing import Any
 
 import httpx
+from pydantic import AnyHttpUrl
+from mcp.server.auth.middleware.auth_context import get_access_token
+from mcp.server.auth.provider import AccessToken, TokenVerifier
+from mcp.server.auth.settings import AuthSettings
 from mcp.server.fastmcp import FastMCP
 
 
@@ -18,45 +27,118 @@ API_BASE_URL = os.getenv(
     "FITNESS_API_BASE_URL",
     "https://fitness-gpt-zr6n.onrender.com",
 ).rstrip("/")
-API_KEY = os.getenv("FITNESS_API_KEY", "").strip()
+MCP_PUBLIC_BASE_URL = os.getenv("MCP_PUBLIC_BASE_URL", "").rstrip("/")
+LEGACY_API_KEY = os.getenv("FITNESS_API_KEY", "").strip()
+INTROSPECTION_SECRET = os.getenv("MCP_OAUTH_INTROSPECTION_SECRET", "").strip()
+OAUTH_ENABLED = os.getenv("MCP_OAUTH_ENABLED", "true").strip().lower() not in {
+    "0", "false", "no", "off"
+}
 REQUEST_TIMEOUT_SECONDS = float(os.getenv("FITNESS_API_TIMEOUT_SECONDS", "120"))
 PORT = int(os.getenv("PORT", "8000"))
+REQUIRED_SCOPE = "fitness.read"
 
 
-mcp = FastMCP(
-    name="Fitness Coaching Connector",
-    instructions=(
-        "Before giving individualized fitness or training advice, call "
-        "get_current_fitness_account, get_coaching_context, and "
-        "get_fitness_summary. Use recent workouts or activity-specific tools "
-        "when more detail is needed. Treat the returned goals, preferences, "
-        "constraints, equipment, availability, and coaching context as the "
-        "user's current persistent instructions. Do not invent missing data."
-    ),
-    host="0.0.0.0",
-    port=PORT,
-    stateless_http=True,
-    json_response=True,
-)
+class FitnessTokenVerifier(TokenVerifier):
+    """Validate opaque access tokens with the Flask authorization server."""
 
+    async def verify_token(self, token: str) -> AccessToken | None:
+        if not token or not INTROSPECTION_SECRET:
+            return None
 
-def _require_configuration() -> None:
-    if not API_KEY:
-        raise RuntimeError(
-            "FITNESS_API_KEY is not configured on the MCP service. "
-            "Set it to the account-specific fitness API key."
+        try:
+            async with httpx.AsyncClient(
+                timeout=REQUEST_TIMEOUT_SECONDS,
+                follow_redirects=False,
+            ) as client:
+                response = await client.post(
+                    f"{API_BASE_URL}/oauth/introspect",
+                    headers={
+                        "Authorization": f"Bearer {INTROSPECTION_SECRET}",
+                        "Accept": "application/json",
+                        "User-Agent": "fitness-coaching-mcp/2.0",
+                    },
+                    data={"token": token},
+                )
+        except httpx.RequestError:
+            return None
+
+        if response.status_code != 200:
+            return None
+        try:
+            payload = response.json()
+        except ValueError:
+            return None
+        if not isinstance(payload, dict) or not payload.get("active"):
+            return None
+
+        scopes = str(payload.get("scope") or "").split()
+        if REQUIRED_SCOPE not in scopes:
+            return None
+        if MCP_PUBLIC_BASE_URL and str(payload.get("aud") or "").rstrip("/") != MCP_PUBLIC_BASE_URL:
+            return None
+
+        return AccessToken(
+            token=token,
+            client_id=str(payload.get("client_id") or "unknown-client"),
+            scopes=scopes,
+            expires_at=int(payload["exp"]) if payload.get("exp") else None,
+            resource=MCP_PUBLIC_BASE_URL or None,
         )
+
+
+def _fastmcp_arguments() -> dict[str, Any]:
+    arguments: dict[str, Any] = {
+        "name": "Fitness Coaching Connector",
+        "instructions": (
+            "Before giving individualized fitness or training advice, call "
+            "get_current_fitness_account, get_coaching_context, and "
+            "get_fitness_summary. Use recent workouts or activity-specific tools "
+            "when more detail is needed. Treat the returned goals, preferences, "
+            "constraints, equipment, availability, and coaching context as the "
+            "user's current persistent instructions. Do not invent missing data."
+        ),
+        "host": "0.0.0.0",
+        "port": PORT,
+        "stateless_http": True,
+        "json_response": True,
+    }
+    if OAUTH_ENABLED:
+        if not MCP_PUBLIC_BASE_URL:
+            raise RuntimeError("MCP_PUBLIC_BASE_URL is required when MCP_OAUTH_ENABLED=true")
+        arguments.update({
+            "token_verifier": FitnessTokenVerifier(),
+            "auth": AuthSettings(
+                issuer_url=AnyHttpUrl(API_BASE_URL),
+                resource_server_url=AnyHttpUrl(MCP_PUBLIC_BASE_URL),
+                required_scopes=[REQUIRED_SCOPE],
+            ),
+        })
+    return arguments
+
+
+mcp = FastMCP(**_fastmcp_arguments())
+
+
+def _active_credential() -> str:
+    if OAUTH_ENABLED:
+        access_token = get_access_token()
+        if not access_token or not access_token.token:
+            raise RuntimeError("No authenticated OAuth access token is available.")
+        return access_token.token
+    if not LEGACY_API_KEY:
+        raise RuntimeError(
+            "FITNESS_API_KEY is required while MCP_OAUTH_ENABLED=false."
+        )
+    return LEGACY_API_KEY
 
 
 def _api_get(path: str) -> dict[str, Any] | list[Any]:
     """Fetch one authenticated JSON response from the Flask fitness API."""
-    _require_configuration()
-
     url = f"{API_BASE_URL}/{path.lstrip('/')}"
     headers = {
-        "Authorization": f"Bearer {API_KEY}",
+        "Authorization": f"Bearer {_active_credential()}",
         "Accept": "application/json",
-        "User-Agent": "fitness-coaching-mcp/1.0",
+        "User-Agent": "fitness-coaching-mcp/2.0",
     }
 
     try:
@@ -98,7 +180,6 @@ def _api_get(path: str) -> dict[str, Any] | list[Any]:
         raise RuntimeError(
             f"The fitness API returned an unexpected JSON type for {path}."
         )
-
     return payload
 
 
@@ -116,10 +197,10 @@ def health_check() -> dict[str, Any]:
     account = _api_get("/whoami")
     if not isinstance(account, dict):
         raise RuntimeError("The fitness API returned an unexpected account payload.")
-
     return {
         "status": "ok",
         "backend": API_BASE_URL,
+        "authentication": "oauth" if OAUTH_ENABLED else "temporary_api_key",
         "authenticated": True,
         "user_id": account.get("user_id"),
     }

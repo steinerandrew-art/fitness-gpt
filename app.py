@@ -37,6 +37,7 @@ from withings_client import (
 
 from datetime import datetime, timezone
 from functools import wraps
+from urllib.parse import urlencode, urlparse
 
 from onboarding_support import (
     ACTIVITY_FREQUENCY_OPTIONS,
@@ -175,14 +176,92 @@ def api_key_from_request():
     return request.headers.get("X-API-Key")
 
 
+def oauth_token_digest(token):
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def service_rows(table, params):
+    response = requests.get(
+        f"{supabase_url()}/rest/v1/{table}",
+        headers=supabase_headers(supabase_secret_key(), supabase_secret_key()),
+        params=params,
+        timeout=20,
+    )
+    if response.status_code != 200:
+        app.logger.warning(
+            "Supabase service lookup failed for %s: %s",
+            table,
+            supabase_error_message(response, "unknown Supabase error"),
+        )
+        return []
+    try:
+        return response.json()
+    except ValueError:
+        return []
+
+
+def service_insert(table, payload):
+    response = requests.post(
+        f"{supabase_url()}/rest/v1/{table}",
+        headers={
+            **supabase_headers(supabase_secret_key(), supabase_secret_key()),
+            "Prefer": "return=representation",
+        },
+        json=payload,
+        timeout=20,
+    )
+    if response.status_code not in {200, 201}:
+        return None, supabase_error_message(response, f"Could not insert {table}")
+    rows = response.json()
+    return (rows[0] if rows else payload), None
+
+
+def service_update(table, filters, payload):
+    response = requests.patch(
+        f"{supabase_url()}/rest/v1/{table}",
+        headers={
+            **supabase_headers(supabase_secret_key(), supabase_secret_key()),
+            "Prefer": "return=representation",
+        },
+        params=filters,
+        json=payload,
+        timeout=20,
+    )
+    if response.status_code not in {200, 204}:
+        return None, supabase_error_message(response, f"Could not update {table}")
+    rows = response.json() if response.text else []
+    return (rows[0] if rows else payload), None
+
+
+def oauth_user_for_access_token(token):
+    if not token:
+        return None
+    now_iso = datetime.now(timezone.utc).isoformat()
+    rows = service_rows(
+        "oauth_access_tokens",
+        {
+            "select": "user_id,client_id,scope,resource,expires_at,revoked_at",
+            "token_hash": f"eq.{oauth_token_digest(token)}",
+            "revoked_at": "is.null",
+            "expires_at": f"gt.{now_iso}",
+            "limit": "1",
+        },
+    )
+    return rows[0] if rows else None
+
+
+def user_id_for_bearer_credential(credential):
+    return user_id_for_api_key(credential) or (oauth_user_for_access_token(credential) or {}).get("user_id")
+
+
 def require_api_user(view_function):
     @wraps(view_function)
     def wrapped(*args, **kwargs):
-        user_id = user_id_for_api_key(api_key_from_request())
+        user_id = user_id_for_bearer_credential(api_key_from_request())
         if not user_id:
             return jsonify({
-                "error": "Valid API key required",
-                "authentication": "Send Authorization: Bearer <API key>"
+                "error": "Valid bearer credential required",
+                "authentication": "Send Authorization: Bearer <API key or OAuth access token>"
             }), 401
 
         return view_function(user_id, *args, **kwargs)
@@ -772,11 +851,23 @@ fieldset{{margin:20px 0;padding:16px;border:1px solid #dfe4ea;border-radius:10px
 </footer></main></body></html>"""
 
 
-def login_form(error_message=None):
+def safe_local_next(value):
+    value = (value or "").strip()
+    if not value.startswith("/") or value.startswith("//"):
+        return "/account"
+    parsed = urlparse(value)
+    if parsed.scheme or parsed.netloc:
+        return "/account"
+    return value
+
+
+def login_form(error_message=None, next_path="/account"):
     error_html = f'<p class="error">{escape(error_message)}</p>' if error_message else ""
+    next_path = safe_local_next(next_path)
     return account_page("Log in", f"""
 <h1>Log in</h1>{error_html}
 <form method="post" action="/login">
+<input type="hidden" name="next" value="{escape(next_path)}">
 <label for="identifier">Email or username</label><input id="identifier" name="identifier" autocomplete="username" required>
 <label for="password">Password</label><input id="password" type="password" name="password" autocomplete="current-password" required>
 <button type="submit">Log in</button></form>
@@ -829,23 +920,24 @@ def register():
 
 @app.route("/login", methods=["GET", "POST"])
 def account_login():
+    next_path = safe_local_next(request.values.get("next"))
     if current_account_session()[1]:
-        return redirect("/account")
+        return redirect(next_path)
     if request.method == "GET":
-        return login_form()
+        return login_form(next_path=next_path)
 
     identifier = request.form.get("identifier", "").strip()
     password = request.form.get("password", "")
     email = lookup_email_for_identifier(identifier)
     if not email:
-        return login_form("The email/username or password was not accepted."), 401
+        return login_form("The email/username or password was not accepted.", next_path), 401
 
     auth_payload, error = supabase_password_login(email, password)
     if error:
-        return login_form("The email/username or password was not accepted."), 401
+        return login_form("The email/username or password was not accepted.", next_path), 401
 
     session_id = create_account_session(auth_payload)
-    response = make_response(redirect("/account"))
+    response = make_response(redirect(next_path))
     response.set_cookie(ACCOUNT_COOKIE_NAME, account_cookie_value(session_id), max_age=ACCOUNT_SESSION_SECONDS, secure=True, httponly=True, samesite="Lax")
     return response
 
@@ -1587,13 +1679,13 @@ def onboarding_integrations(session_data):
     if "claude" in providers:
         claude_instructions = f"""
 <h2>Claude connector setup</h2>
-<p>Claude uses a remote MCP connector rather than the OpenAPI schema. The connector is served through the official MCP Python SDK when <code>MCP_PUBLIC_BASE_URL</code> is configured; otherwise this page falls back to the existing Flask MCP endpoint. Build the connector URL using the full API key shown only when you generate or replace it:</p>
-<p><code style="word-break:break-all">{escape((os.getenv("MCP_PUBLIC_BASE_URL") or request.url_root.rstrip("/")).rstrip("/") + "/mcp/YOUR_FULL_API_KEY")}</code></p>
+<p>Claude uses a remote MCP connector with OAuth. Add the connector URL below; Claude will open this site so you can sign in with the same account credentials used for onboarding and approve read-only access.</p>
+<p><code style="word-break:break-all">{escape((os.getenv("MCP_PUBLIC_BASE_URL") or "MCP_PUBLIC_BASE_URL_NOT_CONFIGURED").rstrip("/") + "/mcp")}</code></p>
 <ol>
   <li>In Claude, open <strong>Settings → Connectors</strong>.</li>
   <li>Select <strong>Add custom connector</strong>.</li>
-  <li>Name it <strong>Fitness Coach</strong>.</li>
-  <li>Replace <code>YOUR_FULL_API_KEY</code> in the URL above with the complete generated key and paste the resulting URL.</li>
+  <li>Name it <strong>Fitness Coach</strong> and paste the connector URL above.</li>
+  <li>When prompted, sign in to this fitness account and approve access.</li>
   <li>Enable the connector in the conversation’s Search and tools menu.</li>
 </ol>
 <h3>Suggested Claude project instructions</h3>
@@ -1607,7 +1699,7 @@ def onboarding_integrations(session_data):
 6. When Withings is unavailable or intentionally skipped, rely on Strava and stored coaching context and clearly identify that limitation.
 7. Do not invent missing measurements or describe unretrieved information as current.
 8. Give practical recommendations and clearly distinguish retrieved data, reasonable inference, and general guidance.</pre>
-<p class="muted">Treat the connector URL like a password. Replacing or revoking the fitness API key immediately invalidates the old connector URL.</p>
+<p class="muted">OAuth tokens are user-specific and short-lived. The connector URL itself is not a secret.</p>
 """
 
     other_instructions = ""
@@ -1728,6 +1820,332 @@ def account_revoke_integration_key(session_data):
             f'<h1>Could not revoke API key</h1><p class="error">{escape(error)}</p>',
         ), 500
     return redirect("/onboarding/integrations")
+
+
+
+# ===========================================================================
+# OAuth authorization server for remote MCP clients
+# ===========================================================================
+
+OAUTH_CODE_SECONDS = 5 * 60
+OAUTH_ACCESS_TOKEN_SECONDS = 60 * 60
+OAUTH_REFRESH_TOKEN_SECONDS = 60 * 60 * 24 * 30
+OAUTH_SCOPE = "fitness.read"
+
+
+def public_app_base_url():
+    return os.getenv("PUBLIC_APP_BASE_URL", request.url_root.rstrip("/")).rstrip("/")
+
+
+def public_mcp_base_url():
+    value = os.getenv("MCP_PUBLIC_BASE_URL", "").rstrip("/")
+    if not value:
+        raise RuntimeError("MCP_PUBLIC_BASE_URL is not configured")
+    return value
+
+
+def oauth_json_error(error, description, status=400):
+    response = jsonify({"error": error, "error_description": description})
+    response.status_code = status
+    response.headers["Cache-Control"] = "no-store"
+    response.headers["Pragma"] = "no-cache"
+    return response
+
+
+def oauth_client(client_id):
+    rows = service_rows(
+        "oauth_clients",
+        {"select": "*", "client_id": f"eq.{client_id}", "limit": "1"},
+    )
+    return rows[0] if rows else None
+
+
+def valid_redirect_uri(client, redirect_uri):
+    return bool(client and redirect_uri in (client.get("redirect_uris") or []))
+
+
+def normalize_scope(scope):
+    requested = [item for item in (scope or OAUTH_SCOPE).split() if item]
+    if not requested or any(item != OAUTH_SCOPE for item in requested):
+        return None
+    return " ".join(dict.fromkeys(requested))
+
+
+def oauth_authorize_parameters(values):
+    return {
+        "response_type": values.get("response_type", ""),
+        "client_id": values.get("client_id", ""),
+        "redirect_uri": values.get("redirect_uri", ""),
+        "scope": values.get("scope", OAUTH_SCOPE),
+        "state": values.get("state", ""),
+        "code_challenge": values.get("code_challenge", ""),
+        "code_challenge_method": values.get("code_challenge_method", ""),
+        "resource": values.get("resource", ""),
+    }
+
+
+def validate_authorize_parameters(params):
+    client = oauth_client(params["client_id"])
+    if params["response_type"] != "code":
+        return None, "unsupported_response_type", "Only authorization_code is supported."
+    if not client:
+        return None, "invalid_request", "Unknown OAuth client."
+    if not valid_redirect_uri(client, params["redirect_uri"]):
+        return None, "invalid_request", "The redirect URI is not registered for this client."
+    if params["code_challenge_method"] != "S256" or not params["code_challenge"]:
+        return None, "invalid_request", "PKCE using S256 is required."
+    if normalize_scope(params["scope"]) is None:
+        return None, "invalid_scope", "Only fitness.read is supported."
+    expected_resource = public_mcp_base_url()
+    if params["resource"] and params["resource"].rstrip("/") != expected_resource:
+        return None, "invalid_target", "The requested resource is not this MCP server."
+    params["resource"] = expected_resource
+    params["scope"] = normalize_scope(params["scope"])
+    return client, None, None
+
+
+def oauth_redirect_error(redirect_uri, state, error, description):
+    query = {"error": error, "error_description": description}
+    if state:
+        query["state"] = state
+    separator = "&" if "?" in redirect_uri else "?"
+    return redirect(redirect_uri + separator + urlencode(query))
+
+
+@app.route("/.well-known/oauth-authorization-server")
+def oauth_authorization_server_metadata():
+    base = public_app_base_url()
+    return jsonify({
+        "issuer": base,
+        "authorization_endpoint": f"{base}/oauth/authorize",
+        "token_endpoint": f"{base}/oauth/token",
+        "registration_endpoint": f"{base}/oauth/register",
+        "introspection_endpoint": f"{base}/oauth/introspect",
+        "response_types_supported": ["code"],
+        "grant_types_supported": ["authorization_code", "refresh_token"],
+        "token_endpoint_auth_methods_supported": ["none"],
+        "code_challenge_methods_supported": ["S256"],
+        "scopes_supported": [OAUTH_SCOPE],
+    })
+
+
+@app.route("/oauth/register", methods=["POST"])
+def oauth_register_client():
+    payload = request.get_json(silent=True) or {}
+    redirect_uris = payload.get("redirect_uris") or []
+    if not isinstance(redirect_uris, list) or not redirect_uris:
+        return oauth_json_error("invalid_client_metadata", "At least one redirect_uri is required.")
+    if any(not isinstance(uri, str) or not uri.startswith(("https://", "http://localhost", "http://127.0.0.1")) for uri in redirect_uris):
+        return oauth_json_error("invalid_redirect_uri", "Redirect URIs must use HTTPS, localhost, or 127.0.0.1.")
+    if payload.get("token_endpoint_auth_method", "none") != "none":
+        return oauth_json_error("invalid_client_metadata", "Only public clients using token_endpoint_auth_method=none are supported.")
+
+    client_id = "mcp_" + secrets.token_urlsafe(24)
+    client = {
+        "client_id": client_id,
+        "client_name": str(payload.get("client_name") or "MCP client")[:200],
+        "redirect_uris": redirect_uris,
+        "grant_types": ["authorization_code", "refresh_token"],
+        "response_types": ["code"],
+        "token_endpoint_auth_method": "none",
+    }
+    _, error = service_insert("oauth_clients", client)
+    if error:
+        return oauth_json_error("server_error", error, 500)
+    response = jsonify(client)
+    response.status_code = 201
+    response.headers["Cache-Control"] = "no-store"
+    return response
+
+
+@app.route("/oauth/authorize", methods=["GET", "POST"])
+def oauth_authorize():
+    params = oauth_authorize_parameters(request.values)
+    client, error, description = validate_authorize_parameters(params)
+    if error:
+        if client and valid_redirect_uri(client, params["redirect_uri"]):
+            return oauth_redirect_error(params["redirect_uri"], params["state"], error, description)
+        return account_page("Authorization error", f'<h1>Authorization could not begin</h1><p class="error">{escape(description)}</p>'), 400
+
+    _, session_data = current_account_session()
+    if not session_data:
+        next_path = "/oauth/authorize?" + urlencode(params)
+        return redirect("/login?" + urlencode({"next": next_path}))
+
+    if request.method == "GET":
+        hidden = "".join(
+            f'<input type="hidden" name="{escape(key)}" value="{escape(value)}">'
+            for key, value in params.items()
+        )
+        client_name = escape(client.get("client_name") or "Claude")
+        return account_page("Authorize fitness access", f"""
+<h1>Allow {client_name} to access your fitness coaching data?</h1>
+<p>This grants read-only access to your account profile, coaching context, goals, recent workouts, activity details, zones, and available body-composition summaries.</p>
+<p><strong>Signed in as:</strong> {escape(session_data.get("email") or session_data["user_id"])}</p>
+<form method="post" action="/oauth/authorize">{hidden}
+<div class="actions"><button type="submit" name="decision" value="approve">Allow access</button>
+<button class="secondary" type="submit" name="decision" value="deny">Cancel</button></div></form>
+<p class="muted">The client cannot change your fitness data. You can revoke access later by disconnecting the connector or revoking its token.</p>
+""")
+
+    if request.form.get("decision") != "approve":
+        return oauth_redirect_error(params["redirect_uri"], params["state"], "access_denied", "The user declined access.")
+
+    raw_code = secrets.token_urlsafe(32)
+    payload = {
+        "code_hash": oauth_token_digest(raw_code),
+        "user_id": session_data["user_id"],
+        "client_id": params["client_id"],
+        "redirect_uri": params["redirect_uri"],
+        "scope": params["scope"],
+        "resource": params["resource"],
+        "code_challenge": params["code_challenge"],
+        "expires_at": datetime.fromtimestamp(time.time() + OAUTH_CODE_SECONDS, timezone.utc).isoformat(),
+    }
+    _, insert_error = service_insert("oauth_authorization_codes", payload)
+    if insert_error:
+        return account_page("Authorization error", f'<h1>Could not authorize access</h1><p class="error">{escape(insert_error)}</p>'), 500
+
+    query = {"code": raw_code}
+    if params["state"]:
+        query["state"] = params["state"]
+    separator = "&" if "?" in params["redirect_uri"] else "?"
+    return redirect(params["redirect_uri"] + separator + urlencode(query))
+
+
+def pkce_s256(value):
+    digest = hashlib.sha256(value.encode("ascii")).digest()
+    return base64.urlsafe_b64encode(digest).decode("ascii").rstrip("=")
+
+
+def issue_oauth_tokens(user_id, client_id, scope, resource):
+    access_token = "mcp_at_" + secrets.token_urlsafe(32)
+    refresh_token = "mcp_rt_" + secrets.token_urlsafe(40)
+    now = time.time()
+    access_payload = {
+        "token_hash": oauth_token_digest(access_token),
+        "user_id": user_id,
+        "client_id": client_id,
+        "scope": scope,
+        "resource": resource,
+        "expires_at": datetime.fromtimestamp(now + OAUTH_ACCESS_TOKEN_SECONDS, timezone.utc).isoformat(),
+    }
+    refresh_payload = {
+        "token_hash": oauth_token_digest(refresh_token),
+        "user_id": user_id,
+        "client_id": client_id,
+        "scope": scope,
+        "resource": resource,
+        "expires_at": datetime.fromtimestamp(now + OAUTH_REFRESH_TOKEN_SECONDS, timezone.utc).isoformat(),
+    }
+    _, access_error = service_insert("oauth_access_tokens", access_payload)
+    if access_error:
+        return None, None, access_error
+    _, refresh_error = service_insert("oauth_refresh_tokens", refresh_payload)
+    if refresh_error:
+        return None, None, refresh_error
+    return access_token, refresh_token, None
+
+
+@app.route("/oauth/token", methods=["POST"])
+def oauth_token():
+    grant_type = request.form.get("grant_type", "")
+    client_id = request.form.get("client_id", "")
+    client = oauth_client(client_id)
+    if not client:
+        return oauth_json_error("invalid_client", "Unknown OAuth client.", 401)
+
+    if grant_type == "authorization_code":
+        code = request.form.get("code", "")
+        redirect_uri = request.form.get("redirect_uri", "")
+        verifier = request.form.get("code_verifier", "")
+        rows = service_rows(
+            "oauth_authorization_codes",
+            {
+                "select": "*",
+                "code_hash": f"eq.{oauth_token_digest(code)}",
+                "client_id": f"eq.{client_id}",
+                "used_at": "is.null",
+                "expires_at": f"gt.{datetime.now(timezone.utc).isoformat()}",
+                "limit": "1",
+            },
+        )
+        record = rows[0] if rows else None
+        if not record or redirect_uri != record.get("redirect_uri"):
+            return oauth_json_error("invalid_grant", "The authorization code is invalid or expired.")
+        if not verifier or not hmac.compare_digest(pkce_s256(verifier), record.get("code_challenge") or ""):
+            return oauth_json_error("invalid_grant", "PKCE verification failed.")
+        _, update_error = service_update(
+            "oauth_authorization_codes",
+            {"code_hash": f"eq.{oauth_token_digest(code)}", "used_at": "is.null"},
+            {"used_at": datetime.now(timezone.utc).isoformat()},
+        )
+        if update_error:
+            return oauth_json_error("server_error", update_error, 500)
+        access_token, refresh_token, issue_error = issue_oauth_tokens(
+            record["user_id"], client_id, record["scope"], record["resource"]
+        )
+        if issue_error:
+            return oauth_json_error("server_error", issue_error, 500)
+
+    elif grant_type == "refresh_token":
+        supplied_refresh = request.form.get("refresh_token", "")
+        rows = service_rows(
+            "oauth_refresh_tokens",
+            {
+                "select": "*",
+                "token_hash": f"eq.{oauth_token_digest(supplied_refresh)}",
+                "client_id": f"eq.{client_id}",
+                "revoked_at": "is.null",
+                "expires_at": f"gt.{datetime.now(timezone.utc).isoformat()}",
+                "limit": "1",
+            },
+        )
+        record = rows[0] if rows else None
+        if not record:
+            return oauth_json_error("invalid_grant", "The refresh token is invalid or expired.")
+        service_update(
+            "oauth_refresh_tokens",
+            {"token_hash": f"eq.{oauth_token_digest(supplied_refresh)}", "revoked_at": "is.null"},
+            {"revoked_at": datetime.now(timezone.utc).isoformat()},
+        )
+        access_token, refresh_token, issue_error = issue_oauth_tokens(
+            record["user_id"], client_id, record["scope"], record["resource"]
+        )
+        if issue_error:
+            return oauth_json_error("server_error", issue_error, 500)
+    else:
+        return oauth_json_error("unsupported_grant_type", "Only authorization_code and refresh_token are supported.")
+
+    response = jsonify({
+        "access_token": access_token,
+        "token_type": "Bearer",
+        "expires_in": OAUTH_ACCESS_TOKEN_SECONDS,
+        "refresh_token": refresh_token,
+        "scope": record["scope"],
+    })
+    response.headers["Cache-Control"] = "no-store"
+    response.headers["Pragma"] = "no-cache"
+    return response
+
+
+@app.route("/oauth/introspect", methods=["POST"])
+def oauth_introspect():
+    expected = os.getenv("MCP_OAUTH_INTROSPECTION_SECRET", "")
+    supplied = request.headers.get("Authorization", "")
+    if not expected or not supplied.startswith("Bearer ") or not hmac.compare_digest(supplied[7:].strip(), expected):
+        return oauth_json_error("invalid_client", "Introspection authentication failed.", 401)
+    record = oauth_user_for_access_token(request.form.get("token", ""))
+    if not record:
+        return jsonify({"active": False})
+    return jsonify({
+        "active": True,
+        "sub": record["user_id"],
+        "client_id": record["client_id"],
+        "scope": record["scope"],
+        "aud": record["resource"],
+        "exp": int(datetime.fromisoformat(record["expires_at"].replace("Z", "+00:00")).timestamp()),
+    })
 
 
 @app.route("/account")
