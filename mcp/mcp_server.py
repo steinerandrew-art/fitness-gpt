@@ -1,3 +1,12 @@
+"""Remote MCP adapter for the Fitness Coaching API.
+
+Claude connects to this server over Streamable HTTP. The server authenticates to
+an existing Flask fitness API with one account-specific bearer token and exposes
+the same read-only coaching data available to the ChatGPT Action integration.
+"""
+
+from __future__ import annotations
+
 import os
 from typing import Any
 
@@ -5,19 +14,24 @@ import httpx
 from mcp.server.fastmcp import FastMCP
 
 
-FITNESS_API_BASE_URL = os.getenv(
+API_BASE_URL = os.getenv(
     "FITNESS_API_BASE_URL",
     "https://fitness-gpt-zr6n.onrender.com",
 ).rstrip("/")
-
+API_KEY = os.getenv("FITNESS_API_KEY", "").strip()
+REQUEST_TIMEOUT_SECONDS = float(os.getenv("FITNESS_API_TIMEOUT_SECONDS", "120"))
 PORT = int(os.getenv("PORT", "8000"))
 
+
 mcp = FastMCP(
-    "Fitness Coach",
+    name="Fitness Coaching Connector",
     instructions=(
-        "Retrieve current workout and health data from the Fitness GPT backend. "
-        "Use get_summary for an aggregated training overview and get_workouts "
-        "for recent individual activities."
+        "Before giving individualized fitness or training advice, call "
+        "get_current_fitness_account, get_coaching_context, and "
+        "get_fitness_summary. Use recent workouts or activity-specific tools "
+        "when more detail is needed. Treat the returned goals, preferences, "
+        "constraints, equipment, availability, and coaching context as the "
+        "user's current persistent instructions. Do not invent missing data."
     ),
     host="0.0.0.0",
     port=PORT,
@@ -26,98 +40,118 @@ mcp = FastMCP(
 )
 
 
-async def fetch_backend(
-    endpoint: str,
-    params: dict[str, Any] | None = None,
-) -> Any:
-    """Call the existing Fitness GPT Flask backend."""
-
-    url = f"{FITNESS_API_BASE_URL}/{endpoint.lstrip('/')}"
-
-    try:
-        async with httpx.AsyncClient(
-            timeout=httpx.Timeout(60.0),
-            follow_redirects=True,
-        ) as client:
-            response = await client.get(url, params=params)
-            response.raise_for_status()
-            return response.json()
-
-    except httpx.TimeoutException as exc:
+def _require_configuration() -> None:
+    if not API_KEY:
         raise RuntimeError(
-            f"The fitness backend timed out while requesting {endpoint}."
-        ) from exc
-
-    except httpx.HTTPStatusError as exc:
-        status = exc.response.status_code
-        detail = exc.response.text[:500]
-
-        raise RuntimeError(
-            f"The fitness backend returned HTTP {status} for {endpoint}: "
-            f"{detail}"
-        ) from exc
-
-    except httpx.RequestError as exc:
-        raise RuntimeError(
-            f"Could not connect to the fitness backend for {endpoint}: {exc}"
-        ) from exc
-
-    except ValueError as exc:
-        raise RuntimeError(
-            f"The fitness backend returned invalid JSON for {endpoint}."
-        ) from exc
+            "FITNESS_API_KEY is not configured on the MCP service. "
+            "Set it to the account-specific fitness API key."
+        )
 
 
-@mcp.tool()
-async def health_check() -> dict[str, str]:
-    """Confirm that the MCP server is running and identify its data source."""
+def _api_get(path: str) -> dict[str, Any] | list[Any]:
+    """Fetch one authenticated JSON response from the Flask fitness API."""
+    _require_configuration()
 
-    return {
-        "status": "ok",
-        "backend": FITNESS_API_BASE_URL,
+    url = f"{API_BASE_URL}/{path.lstrip('/')}"
+    headers = {
+        "Authorization": f"Bearer {API_KEY}",
+        "Accept": "application/json",
+        "User-Agent": "fitness-coaching-mcp/1.0",
     }
 
+    try:
+        with httpx.Client(
+            timeout=REQUEST_TIMEOUT_SECONDS,
+            follow_redirects=False,
+        ) as client:
+            response = client.get(url, headers=headers)
+    except httpx.TimeoutException as exc:
+        raise RuntimeError(
+            f"The fitness API timed out while requesting {path}."
+        ) from exc
+    except httpx.RequestError as exc:
+        raise RuntimeError(
+            f"The fitness API could not be reached while requesting {path}: "
+            f"{exc.__class__.__name__}."
+        ) from exc
+
+    try:
+        payload: Any = response.json()
+    except ValueError as exc:
+        preview = response.text[:300].strip()
+        raise RuntimeError(
+            f"The fitness API returned non-JSON content for {path} "
+            f"(HTTP {response.status_code}): {preview or 'empty response'}"
+        ) from exc
+
+    if response.is_error:
+        if isinstance(payload, dict):
+            detail = payload.get("error") or payload.get("message") or payload
+        else:
+            detail = payload
+        raise RuntimeError(
+            f"The fitness API request for {path} failed "
+            f"(HTTP {response.status_code}): {detail}"
+        )
+
+    if not isinstance(payload, (dict, list)):
+        raise RuntimeError(
+            f"The fitness API returned an unexpected JSON type for {path}."
+        )
+
+    return payload
+
+
+def _positive_activity_id(activity_id: int) -> int:
+    if isinstance(activity_id, bool) or not isinstance(activity_id, int):
+        raise ValueError("activity_id must be an integer.")
+    if activity_id <= 0:
+        raise ValueError("activity_id must be greater than zero.")
+    return activity_id
+
 
 @mcp.tool()
-async def get_summary(
-    user_id: str = "primary",
-) -> Any:
-    """
-    Retrieve the current aggregated fitness summary for a user.
-
-    The summary may include recent training volume, activity totals,
-    intensity distribution, Strava information, Withings measurements,
-    trends, and readiness-related data available from the backend.
-
-    Args:
-        user_id: Fitness GPT user identifier. Defaults to "primary".
-    """
-
-    return await fetch_backend(
-        "/summary",
-        params={"user_id": user_id},
-    )
+def health_check() -> dict[str, Any] | list[Any]:
+    """Verify that this MCP server can authenticate to the fitness API."""
+    return _api_get("/whoami")
 
 
 @mcp.tool()
-async def get_workouts(
-    user_id: str = "primary",
-) -> Any:
-    """
-    Retrieve recent individual workouts for a user.
+def get_current_fitness_account() -> dict[str, Any] | list[Any]:
+    """Verify which account is connected, including identity and onboarding status."""
+    return _api_get("/whoami")
 
-    Use this when activity-level detail is needed, including workout type,
-    date, duration, distance, elevation, heart rate, power, pace, zones,
-    or intensity information made available by the backend.
 
-    Args:
-        user_id: Fitness GPT user identifier. Defaults to "primary".
-    """
+@mcp.tool()
+def get_coaching_context() -> dict[str, Any] | list[Any]:
+    """Load the current profile, training preferences, goals, and persistent coaching context."""
+    return _api_get("/coaching-context")
 
-    return await fetch_backend(
-        "/workouts",
-        params={"user_id": user_id},
-    )
+
+@mcp.tool()
+def get_fitness_summary() -> dict[str, Any] | list[Any]:
+    """Load the current 14-day fitness, intensity, readiness, and body-data summary."""
+    return _api_get("/summary")
+
+
+@mcp.tool()
+def get_recent_workouts() -> dict[str, Any] | list[Any]:
+    """Load recent workouts with available heart-rate, power, pace, and zone data."""
+    return _api_get("/workouts")
+
+
+@mcp.tool()
+def get_activity_detail(activity_id: int) -> dict[str, Any] | list[Any]:
+    """Load detailed information for one Strava activity by activity ID."""
+    validated_id = _positive_activity_id(activity_id)
+    return _api_get(f"/activity/{validated_id}")
+
+
+@mcp.tool()
+def get_activity_zones(activity_id: int) -> dict[str, Any] | list[Any]:
+    """Load heart-rate, power, pace, or other zone data for one Strava activity."""
+    validated_id = _positive_activity_id(activity_id)
+    return _api_get(f"/activity/{validated_id}/zones")
 
 
 if __name__ == "__main__":
