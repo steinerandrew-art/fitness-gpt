@@ -2789,15 +2789,27 @@ def strava_source_athlete_id(user_id, payload=None):
     return None
 
 
-def add_activity_identity(payload, user_id):
-    """Add backend/source identity fields while preserving the native Strava payload."""
-    if not isinstance(payload, dict):
-        return payload
-    result = dict(payload)
-    result["user_id"] = user_id
-    result["source"] = "strava"
-    result["source_athlete_id"] = strava_source_athlete_id(user_id, result)
-    return result
+def add_activity_identity(payload, user_id, collection_key=None):
+    """Add backend/source identity fields to activity responses.
+
+    Strava activity details are JSON objects, while activity zones are returned
+    as a JSON array. Arrays cannot carry top-level audit metadata, so callers may
+    provide ``collection_key`` to wrap the native array without altering its
+    individual zone entries.
+    """
+    identity = {
+        "user_id": user_id,
+        "source": "strava",
+        "source_athlete_id": strava_source_athlete_id(user_id, payload),
+    }
+
+    if isinstance(payload, dict):
+        return {**payload, **identity}
+
+    if collection_key and isinstance(payload, list):
+        return {**identity, collection_key: payload}
+
+    return payload
 
 
 @app.route("/activity/<int:activity_id>")
@@ -3825,7 +3837,7 @@ def activity_zones(user_id, activity_id):
             return jsonify({"error": "Strava is not connected for this user"}), 401
 
         return jsonify({"error": message}), status
-    return jsonify(add_activity_identity(zones, user_id))
+    return jsonify(add_activity_identity(zones, user_id, collection_key="zones"))
 
 
 if __name__ == "__main__":
