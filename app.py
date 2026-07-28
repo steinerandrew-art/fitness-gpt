@@ -1555,23 +1555,9 @@ def onboarding_integrations(session_data):
 </form>
 """
 
-    return account_page("AI integrations", f"""
-{onboarding_progress_html(state, "integrations")}
-<h1>AI integrations</h1>
-<p>Generate an account-specific key that an AI assistant can use to request this account’s coaching data. The key grants access to the fitness API; it does not contain or replace an OpenAI or Anthropic account credential.</p>
-{generated_html}
-{key_status}
-<form method="post" action="/account/integrations/providers">
-<fieldset>
-<legend>Where will you use the coaching API?</legend>
-<div class="check-grid">{provider_html}</div>
-</fieldset>
-<div class="actions">
-  <button type="submit">Save integrations</button>
-  <a href="/account">Return to Account</a>
-</div>
-</form>
-<div class="actions">{key_actions}</div>
+    chatgpt_instructions = ""
+    if "chatgpt" in providers:
+        chatgpt_instructions = f"""
 <h2>ChatGPT custom GPT setup</h2>
 <ol>
   <li>In ChatGPT, create or edit a custom GPT.</li>
@@ -1594,6 +1580,22 @@ def onboarding_integrations(session_data):
 5. Treat the coaching context as persistent user instructions. Do not invent missing measurements or claim unavailable data is current.
 6. When Withings is unavailable or intentionally skipped, use Strava and stored coaching context and clearly identify the limitation.
 7. Give practical recommendations that account for available time, preferred activities, equipment, weather strategy, and stated goals.</pre>
+<p class="muted">Creating or editing a custom GPT requires a ChatGPT plan that supports GPT creation. The fitness API key authenticates only to this coaching backend; it is not an OpenAI credential.</p>
+"""
+
+    claude_instructions = ""
+    if "claude" in providers:
+        claude_instructions = f"""
+<h2>Claude connector setup</h2>
+<p>Claude uses a remote MCP connector rather than the OpenAPI schema. The connector is served through the official MCP Python SDK when <code>MCP_PUBLIC_BASE_URL</code> is configured; otherwise this page falls back to the existing Flask MCP endpoint. Build the connector URL using the full API key shown only when you generate or replace it:</p>
+<p><code style="word-break:break-all">{escape((os.getenv("MCP_PUBLIC_BASE_URL") or request.url_root.rstrip("/")).rstrip("/") + "/mcp/YOUR_FULL_API_KEY")}</code></p>
+<ol>
+  <li>In Claude, open <strong>Settings → Connectors</strong>.</li>
+  <li>Select <strong>Add custom connector</strong>.</li>
+  <li>Name it <strong>Fitness Coach</strong>.</li>
+  <li>Replace <code>YOUR_FULL_API_KEY</code> in the URL above with the complete generated key and paste the resulting URL.</li>
+  <li>Enable the connector in the conversation’s Search and tools menu.</li>
+</ol>
 <h3>Suggested Claude project instructions</h3>
 <pre style="white-space:pre-wrap">For every request involving current fitness, workouts, readiness, body composition, training plans, or individualized coaching:
 
@@ -1605,21 +1607,49 @@ def onboarding_integrations(session_data):
 6. When Withings is unavailable or intentionally skipped, rely on Strava and stored coaching context and clearly identify that limitation.
 7. Do not invent missing measurements or describe unretrieved information as current.
 8. Give practical recommendations and clearly distinguish retrieved data, reasonable inference, and general guidance.</pre>
-<p class="muted">Creating or editing a custom GPT requires a ChatGPT plan that supports GPT creation. The fitness API key authenticates only to this coaching backend; it is not an OpenAI credential.</p>
-<p class="muted">Replacing or revoking the key immediately disables the previous key.</p>
-<h2>Claude connector setup</h2>
-<p>Claude uses a remote MCP connector rather than the OpenAPI schema. Build the connector URL using the full API key shown only when you generate or replace it:</p>
-<p><code style="word-break:break-all">{escape(request.url_root.rstrip("/") + "/mcp/YOUR_FULL_API_KEY")}</code></p>
-<ol>
-  <li>In Claude, open <strong>Settings → Connectors</strong>.</li>
-  <li>Select <strong>Add custom connector</strong>.</li>
-  <li>Name it <strong>Fitness Coach</strong>.</li>
-  <li>Replace <code>YOUR_FULL_API_KEY</code> in the URL above with the complete generated key and paste the resulting URL.</li>
-  <li>Enable the connector in the conversation’s Search and tools menu.</li>
-</ol>
 <p class="muted">Treat the connector URL like a password. Replacing or revoking the fitness API key immediately invalidates the old connector URL.</p>
+"""
+
+    other_instructions = ""
+    if "other" in providers:
+        other_instructions = f"""
+<h2>Other AI client setup</h2>
+<p>Use the client’s supported integration method:</p>
+<ul>
+  <li>For an OpenAPI-compatible client, import <code style="word-break:break-all">{escape(request.url_root.rstrip("/") + "/openapi.json")}</code> and authenticate with the generated fitness API key as a bearer token.</li>
+  <li>For an MCP-compatible client, use the MCP connector URL format shown for supported remote connectors and treat the complete URL as a password.</li>
+</ul>
+<p class="muted">Exact menus and authentication options vary by client.</p>
+"""
+
+    selected_instructions = chatgpt_instructions + claude_instructions + other_instructions
+    if not selected_instructions:
+        selected_instructions = """
+<p class="muted">Select one or more AI clients above and save the integrations to display setup instructions.</p>
+"""
+
+    return account_page("AI integrations", f"""
+{onboarding_progress_html(state, "integrations")}
+<h1>AI integrations</h1>
+<p>Generate an account-specific key that an AI assistant can use to request this account’s coaching data. The key grants access to the fitness API; it does not contain or replace an OpenAI or Anthropic account credential.</p>
+{generated_html}
+{key_status}
+<form method="post" action="/account/integrations/providers">
+<fieldset>
+<legend>Where will you use the coaching API?</legend>
+<div class="check-grid">{provider_html}</div>
+</fieldset>
+<div class="actions">
+  <button type="submit">Save integrations</button>
+  <a href="/account">Return to Account</a>
+</div>
+</form>
+<div class="actions">{key_actions}</div>
+{selected_instructions}
+<p class="muted">Replacing or revoking the key immediately disables the previous key.</p>
 <p>Review the <a href="/privacy">Privacy Policy</a> for details about connected data, storage, AI clients, and account deletion.</p>
 """)
+
 
 
 @app.route("/account/integrations/providers", methods=["POST"])

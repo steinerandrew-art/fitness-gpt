@@ -111,9 +111,18 @@ def _positive_activity_id(activity_id: int) -> int:
 
 
 @mcp.tool()
-def health_check() -> dict[str, Any] | list[Any]:
-    """Verify that this MCP server can authenticate to the fitness API."""
-    return _api_get("/whoami")
+def health_check() -> dict[str, Any]:
+    """Verify that this MCP server can reach and authenticate to the fitness API."""
+    account = _api_get("/whoami")
+    if not isinstance(account, dict):
+        raise RuntimeError("The fitness API returned an unexpected account payload.")
+
+    return {
+        "status": "ok",
+        "backend": API_BASE_URL,
+        "authenticated": True,
+        "user_id": account.get("user_id"),
+    }
 
 
 @mcp.tool()
