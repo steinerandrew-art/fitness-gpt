@@ -10,7 +10,7 @@ from html import escape
 
 import requests
 
-from flask import Flask, Response, jsonify, make_response, redirect, request
+from flask import Flask, Response, g, jsonify, make_response, redirect, request
 
 from strava_client import (
     CLIENT_ID,
@@ -250,20 +250,34 @@ def oauth_user_for_access_token(token):
     return rows[0] if rows else None
 
 
+def identity_for_bearer_credential(credential):
+    user_id = user_id_for_api_key(credential)
+    if user_id:
+        return user_id, "api_key"
+
+    oauth_token = oauth_user_for_access_token(credential)
+    if oauth_token:
+        return oauth_token.get("user_id"), "oauth"
+
+    return None, None
+
+
 def user_id_for_bearer_credential(credential):
-    return user_id_for_api_key(credential) or (oauth_user_for_access_token(credential) or {}).get("user_id")
+    user_id, _authentication = identity_for_bearer_credential(credential)
+    return user_id
 
 
 def require_api_user(view_function):
     @wraps(view_function)
     def wrapped(*args, **kwargs):
-        user_id = user_id_for_bearer_credential(api_key_from_request())
+        user_id, authentication = identity_for_bearer_credential(api_key_from_request())
         if not user_id:
             return jsonify({
                 "error": "Valid bearer credential required",
                 "authentication": "Send Authorization: Bearer <API key or OAuth access token>"
             }), 401
 
+        g.api_authentication = authentication
         return view_function(user_id, *args, **kwargs)
 
     return wrapped
@@ -2496,7 +2510,7 @@ def api_whoami(user_id):
     ) or {}
 
     return jsonify({
-        "authentication": "api_key",
+        "authentication": getattr(g, "api_authentication", "internal"),
         "user_id": user_id,
         "username": profile.get("username"),
         "display_name": profile.get("display_name"),
