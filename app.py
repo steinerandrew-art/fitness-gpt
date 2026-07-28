@@ -2768,6 +2768,38 @@ def openapi_schema():
         },
     })
 
+def strava_source_athlete_id(user_id, payload=None):
+    """Return the linked Strava athlete ID without conflating it with our user UUID."""
+    if isinstance(payload, dict):
+        athlete = payload.get("athlete")
+        if isinstance(athlete, dict) and athlete.get("id") is not None:
+            return athlete.get("id")
+        for key in ("source_athlete_id", "athlete_id", "strava_athlete_id"):
+            if payload.get(key) is not None:
+                return payload.get(key)
+
+    connection = strava_connection(user_id)
+    if isinstance(connection, dict):
+        athlete = connection.get("athlete")
+        if isinstance(athlete, dict) and athlete.get("id") is not None:
+            return athlete.get("id")
+        for key in ("athlete_id", "strava_athlete_id", "source_athlete_id"):
+            if connection.get(key) is not None:
+                return connection.get(key)
+    return None
+
+
+def add_activity_identity(payload, user_id):
+    """Add backend/source identity fields while preserving the native Strava payload."""
+    if not isinstance(payload, dict):
+        return payload
+    result = dict(payload)
+    result["user_id"] = user_id
+    result["source"] = "strava"
+    result["source_athlete_id"] = strava_source_athlete_id(user_id, result)
+    return result
+
+
 @app.route("/activity/<int:activity_id>")
 @require_api_user
 def activity_detail(user_id, activity_id):
@@ -2775,7 +2807,7 @@ def activity_detail(user_id, activity_id):
     if error:
         message, status = error
         return jsonify({"error": message}), status
-    return jsonify(detail)
+    return jsonify(add_activity_identity(detail, user_id))
 
 BIKE_SPORTS = {"Ride", "VirtualRide"}
 
@@ -3788,12 +3820,12 @@ def activity_zones(user_id, activity_id):
     zones, error = get_activity_zones(activity_id, user_id=user_id)
     if error:
         message, status = error
-      
+
         if status == 401:
             return jsonify({"error": "Strava is not connected for this user"}), 401
 
         return jsonify({"error": message}), status
-    return jsonify(zones)
+    return jsonify(add_activity_identity(zones, user_id))
 
 
 if __name__ == "__main__":

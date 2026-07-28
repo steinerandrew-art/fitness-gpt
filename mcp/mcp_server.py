@@ -5,8 +5,10 @@ This service is the MCP resource server: it validates Claude's bearer token by
 calling the Flask app's introspection endpoint, then forwards that same token to
 the existing read-only fitness API endpoints.
 
-Set MCP_OAUTH_ENABLED=false temporarily to retain the previously validated
-single-account FITNESS_API_KEY behavior during deployment testing.
+OAuth is mandatory for this service. The former shared-key fallback has been
+removed from active execution so every MCP request must resolve through a
+user-specific OAuth access token. Retain the prior version in source control
+only as a rollback reference.
 """
 
 from __future__ import annotations
@@ -28,11 +30,7 @@ API_BASE_URL = os.getenv(
     "https://fitness-gpt-zr6n.onrender.com",
 ).rstrip("/")
 MCP_PUBLIC_BASE_URL = os.getenv("MCP_PUBLIC_BASE_URL", "").rstrip("/")
-LEGACY_API_KEY = os.getenv("FITNESS_API_KEY", "").strip()
 INTROSPECTION_SECRET = os.getenv("MCP_OAUTH_INTROSPECTION_SECRET", "").strip()
-OAUTH_ENABLED = os.getenv("MCP_OAUTH_ENABLED", "true").strip().lower() not in {
-    "0", "false", "no", "off"
-}
 REQUEST_TIMEOUT_SECONDS = float(os.getenv("FITNESS_API_TIMEOUT_SECONDS", "120"))
 PORT = int(os.getenv("PORT", "8000"))
 REQUIRED_SCOPE = "fitness.read"
@@ -102,17 +100,16 @@ def _fastmcp_arguments() -> dict[str, Any]:
         "stateless_http": True,
         "json_response": True,
     }
-    if OAUTH_ENABLED:
-        if not MCP_PUBLIC_BASE_URL:
-            raise RuntimeError("MCP_PUBLIC_BASE_URL is required when MCP_OAUTH_ENABLED=true")
-        arguments.update({
-            "token_verifier": FitnessTokenVerifier(),
-            "auth": AuthSettings(
-                issuer_url=AnyHttpUrl(API_BASE_URL),
-                resource_server_url=AnyHttpUrl(MCP_PUBLIC_BASE_URL),
-                required_scopes=[REQUIRED_SCOPE],
-            ),
-        })
+    if not MCP_PUBLIC_BASE_URL:
+        raise RuntimeError("MCP_PUBLIC_BASE_URL is required for OAuth-protected MCP access")
+    arguments.update({
+        "token_verifier": FitnessTokenVerifier(),
+        "auth": AuthSettings(
+            issuer_url=AnyHttpUrl(API_BASE_URL),
+            resource_server_url=AnyHttpUrl(MCP_PUBLIC_BASE_URL),
+            required_scopes=[REQUIRED_SCOPE],
+        ),
+    })
     return arguments
 
 
@@ -120,16 +117,10 @@ mcp = FastMCP(**_fastmcp_arguments())
 
 
 def _active_credential() -> str:
-    if OAUTH_ENABLED:
-        access_token = get_access_token()
-        if not access_token or not access_token.token:
-            raise RuntimeError("No authenticated OAuth access token is available.")
-        return access_token.token
-    if not LEGACY_API_KEY:
-        raise RuntimeError(
-            "FITNESS_API_KEY is required while MCP_OAUTH_ENABLED=false."
-        )
-    return LEGACY_API_KEY
+    access_token = get_access_token()
+    if not access_token or not access_token.token:
+        raise RuntimeError("No authenticated OAuth access token is available.")
+    return access_token.token
 
 
 def _api_get(path: str) -> dict[str, Any] | list[Any]:
@@ -200,7 +191,7 @@ def health_check() -> dict[str, Any]:
     return {
         "status": "ok",
         "backend": API_BASE_URL,
-        "authentication": "oauth" if OAUTH_ENABLED else "temporary_api_key",
+        "authentication": "oauth",
         "authenticated": True,
         "user_id": account.get("user_id"),
     }
