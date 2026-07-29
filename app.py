@@ -465,6 +465,47 @@ def supabase_signup(email, password, username, display_name):
     return response.json(), None
 
 
+def supabase_request_password_reset(email):
+    response = requests.post(
+        f"{supabase_url()}/auth/v1/recover",
+        headers=supabase_headers(supabase_publishable_key()),
+        params={"redirect_to": f"{public_app_base_url()}/reset-password"},
+        json={"email": email},
+        timeout=15,
+    )
+    if response.status_code not in {200, 201}:
+        return False, supabase_error_message(response, "The reset email could not be sent.")
+    return True, None
+
+
+def supabase_update_password(access_token, password):
+    response = requests.put(
+        f"{supabase_url()}/auth/v1/user",
+        headers=supabase_headers(supabase_publishable_key(), access_token),
+        json={"password": password},
+        timeout=15,
+    )
+    if response.status_code != 200:
+        return False, supabase_error_message(response, "The password could not be updated.")
+    return True, None
+
+
+def friendly_goal_error(message):
+    text = (message or "").strip()
+    lowered = text.lower()
+    if "coaching_goals_status_check" in lowered:
+        return "A goal has an invalid Status. Choose Active, Planned, or Ongoing / maintenance."
+    if "coaching_goals_priority_range" in lowered:
+        return "A goal has an invalid position. Goals must be numbered from 1 through 5."
+    if "coaching_goals_user_priority_unique" in lowered:
+        return "Two goals were assigned the same position. Reload the page and try saving again."
+    if "coaching_goals_type_check" in lowered:
+        return "A goal has an unsupported goal type. Reload the page and try saving again."
+    if "violates check constraint" in lowered:
+        return "One of the goal fields contains a value the database does not accept. Review the highlighted fields and try again."
+    return text or "The goals could not be saved."
+
+
 def supabase_refresh_session(refresh_token):
     response = requests.post(
         f"{supabase_url()}/auth/v1/token",
@@ -769,9 +810,9 @@ def replace_coaching_goals(access_token, goals):
         timeout=15,
     )
     if response.status_code not in {200, 204}:
-        message = supabase_error_message(response, "The goals could not be saved.")
-        app.logger.warning("Supabase goals replacement failed: %s", message)
-        return False, message
+        raw_message = supabase_error_message(response, "The goals could not be saved.")
+        app.logger.warning("Supabase goals replacement failed: %s", raw_message)
+        return False, friendly_goal_error(raw_message)
     return True, None
 
 
@@ -885,18 +926,25 @@ def login_form(error_message=None, next_path="/account"):
 <label for="identifier">Email or username</label><input id="identifier" name="identifier" autocomplete="username" required>
 <label for="password">Password</label><input id="password" type="password" name="password" autocomplete="current-password" required>
 <button type="submit">Log in</button></form>
+<p><a href="/forgot-password">Forgot your password?</a></p>
 <p>Need an account? <a href="/register">Create one</a>.</p><p class="muted">By using this service, you acknowledge the <a href="/privacy">Privacy Policy</a>.</p>""")
 
 
-def registration_form(error_message=None):
+def registration_form(error_message=None, values=None, field_errors=None):
+    values = values or {}
+    field_errors = field_errors or {}
     error_html = f'<p class="error">{escape(error_message)}</p>' if error_message else ""
+    def field_error(name):
+        message = field_errors.get(name)
+        return f'<p class="error" id="{name}_error">{escape(message)}</p>' if message else ""
     return account_page("Create account", f"""
 <h1>Create an account</h1>{error_html}
 <form method="post" action="/register">
-<label for="email">Email</label><input id="email" type="email" name="email" autocomplete="email" required>
-<label for="username">Username</label><input id="username" name="username" pattern="[A-Za-z0-9_-]{{3,30}}" autocomplete="username" required>
-<label for="display_name">Display name</label><input id="display_name" name="display_name" autocomplete="name">
-<label for="password">Password</label><input id="password" type="password" name="password" minlength="8" autocomplete="new-password" required>
+<label for="email">Email</label><input id="email" type="email" name="email" autocomplete="email" value="{escape(values.get('email', ''))}" required>{field_error('email')}
+<label for="username">Username</label><input id="username" name="username" pattern="[A-Za-z0-9_-]{{3,30}}" autocomplete="username" value="{escape(values.get('username', ''))}" required>{field_error('username')}
+<label for="display_name">Display name</label><input id="display_name" name="display_name" autocomplete="name" value="{escape(values.get('display_name', ''))}">
+<label for="password">Password</label><input id="password" type="password" name="password" minlength="8" autocomplete="new-password" required>{field_error('password')}
+<label for="password_confirm">Confirm password</label><input id="password_confirm" type="password" name="password_confirm" minlength="8" autocomplete="new-password" required>{field_error('password_confirm')}
 <button type="submit">Create account</button></form>
 <p>Already registered? <a href="/login">Log in</a>.</p><p class="muted">By creating an account, you acknowledge the <a href="/privacy">Privacy Policy</a>.</p>""")
 
@@ -912,15 +960,19 @@ def register():
     username = request.form.get("username", "").strip()
     display_name = request.form.get("display_name", "").strip()
     password = request.form.get("password", "")
+    password_confirm = request.form.get("password_confirm", "")
+    values = {"email": email, "username": username, "display_name": display_name}
 
     if not re.fullmatch(r"[A-Za-z0-9_-]{3,30}", username):
-        return registration_form("Username must be 3–30 characters using letters, numbers, underscores, or hyphens."), 400
+        return registration_form(values=values, field_errors={"username": "Username must be 3–30 characters using letters, numbers, underscores, or hyphens."}), 400
     if len(password) < 8:
-        return registration_form("Password must contain at least eight characters."), 400
+        return registration_form(values=values, field_errors={"password": "Password must contain at least eight characters."}), 400
+    if password != password_confirm:
+        return registration_form(values=values, field_errors={"password_confirm": "The two passwords do not match."}), 400
 
     auth_payload, error = supabase_signup(email, password, username, display_name)
     if error:
-        return registration_form(error), 400
+        return registration_form(error, values=values), 400
     if not auth_payload.get("access_token"):
         return account_page("Check your email", """
 <h1>Check your email</h1><p class="success">Your account was created. Supabase will send the confirmation message on behalf of Fitness Coaching, so the sender may appear as Supabase. Follow that link, then return here to log in.</p>
@@ -954,6 +1006,79 @@ def account_login():
     response = make_response(redirect(next_path))
     response.set_cookie(ACCOUNT_COOKIE_NAME, account_cookie_value(session_id), max_age=ACCOUNT_SESSION_SECONDS, secure=True, httponly=True, samesite="Lax")
     return response
+
+
+@app.route("/forgot-password", methods=["GET", "POST"])
+def forgot_password():
+    message = None
+    error_message = None
+    email = request.form.get("email", "").strip().lower()
+    if request.method == "POST":
+        if not email or "@" not in email:
+            error_message = "Enter the email address associated with the account."
+        else:
+            ok, error = supabase_request_password_reset(email)
+            if not ok:
+                app.logger.warning("Password reset request failed: %s", error)
+            # Do not reveal whether an address exists.
+            message = "If an account exists for that email address, a password-reset link has been sent."
+    error_html = f'<p class="error">{escape(error_message)}</p>' if error_message else ""
+    success_html = f'<p class="success">{escape(message)}</p>' if message else ""
+    return account_page("Reset password", f"""
+<h1>Reset your password</h1>
+<p>Enter the email address used for your Fitness Coaching account.</p>
+{error_html}{success_html}
+<form method="post">
+<label for="email">Email</label><input id="email" type="email" name="email" autocomplete="email" value="{escape(email)}" required>
+<button type="submit">Send reset link</button>
+</form>
+<p><a href="/login">Return to login</a></p>""")
+
+
+@app.route("/reset-password", methods=["GET", "POST"])
+def reset_password():
+    error_message = None
+    success_message = None
+    if request.method == "POST":
+        access_token = request.form.get("access_token", "").strip()
+        password = request.form.get("password", "")
+        password_confirm = request.form.get("password_confirm", "")
+        if not access_token:
+            error_message = "This reset link is missing or expired. Request a new password-reset email."
+        elif len(password) < 8:
+            error_message = "Password must contain at least eight characters."
+        elif password != password_confirm:
+            error_message = "The two passwords do not match."
+        else:
+            ok, error = supabase_update_password(access_token, password)
+            if ok:
+                success_message = "Your password has been updated. You can now log in."
+            else:
+                app.logger.warning("Password update failed: %s", error)
+                error_message = "The reset link is invalid or expired. Request a new password-reset email."
+    error_html = f'<p class="error">{escape(error_message)}</p>' if error_message else ""
+    success_html = f'<p class="success">{escape(success_message)}</p>' if success_message else ""
+    form_html = "" if success_message else """
+<form method="post" id="reset-form">
+<input type="hidden" name="access_token" id="access_token">
+<label for="password">New password</label><input id="password" type="password" name="password" minlength="8" autocomplete="new-password" required>
+<label for="password_confirm">Confirm new password</label><input id="password_confirm" type="password" name="password_confirm" minlength="8" autocomplete="new-password" required>
+<button type="submit">Update password</button>
+</form>
+<script>
+(function () {
+  const params = new URLSearchParams(window.location.hash.slice(1));
+  const token = params.get('access_token');
+  const input = document.getElementById('access_token');
+  if (input && token) input.value = token;
+})();
+</script>
+"""
+    return account_page("Choose a new password", f"""
+<h1>Choose a new password</h1>
+{error_html}{success_html}{form_html}
+<p><a href="/forgot-password">Request another reset link</a></p>
+<p><a href="/login">Return to login</a></p>""")
 
 
 @app.route("/logout", methods=["POST"])
